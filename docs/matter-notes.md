@@ -270,21 +270,3 @@ starting state.** An automation whose action was "set Lamp 2 to 50%" against a
 lamp already at 50% (128/255) fired correctly and changed nothing observable,
 which read as a failure and sent us chasing a bug that did not exist.
 
-## Board notes (Waveshare ESP32-S3-Touch-AMOLED-1.8 V2)
-
-- The CST816 touch controller reports nothing until its interrupt mode is
-  configured — write `0xFA = 0x10`. Without it the coordinate registers read
-  fine but never change. It also needs a few hundred ms after reset before it
-  answers at all.
-- `Arduino_CO5300::displayOff()` issues `SLPIN`, and the touch controller
-  shares the display module's power domain — so sleeping the panel kills touch
-  and nothing can wake the device. Blank the framebuffer and set brightness to
-  zero instead; on an AMOLED that is the real saving anyway.
-- The CO5300 leaves the panel black if a frame arrives as many small writes.
-  Push the whole framebuffer in one transaction.
-- `Arduino_Canvas::begin()` allocates its framebuffer with `aligned_alloc`,
-  which is internal RAM only; 322 KB will not fit beside the Matter stack.
-  Pre-seed `_framebuffer` from PSRAM so `begin()` skips the allocation.
-- The ESP32-S3 talks USB-Serial-JTAG, which gates its output on DTR. Clearing
-  DTR to avoid a reset on connect does not avoid the reset — it just makes the
-  device go silent.
