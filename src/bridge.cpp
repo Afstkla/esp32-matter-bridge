@@ -76,9 +76,14 @@ endpoint_t *BridgedAccessory::createNode(const char *name) {
   }
   endpoint::set_parent_endpoint(endpoint, s_aggregator);
 
+  // Deliberately not create_node_label(): it forces ATTRIBUTE_FLAG_NONVOLATILE,
+  // which costs 53 KB of internal DRAM per endpoint on esp_matter 1.5 and
+  // starves the WiFi driver after three accessories. The names are persisted in
+  // Preferences and reapplied on boot, so Matter does not need to store them.
   cluster_t *info = cluster::get(endpoint, BridgedDeviceBasicInformation::Id);
-  cluster::bridged_device_basic_information::attribute::create_node_label(info, _name,
-                                                                         sizeof(_name) - 1);
+  esp_matter::attribute::create(info, BridgedDeviceBasicInformation::Attributes::NodeLabel::Id,
+                                ATTRIBUTE_FLAG_WRITABLE, esp_matter_char_str(_name, sizeof(_name) - 1),
+                                sizeof(_name) - 1);
   return endpoint;
 }
 
@@ -89,18 +94,14 @@ bool BridgedAccessory::beginSwitch(const char *name) {
   }
 
   generic_switch::config_t config;
+  // The cluster aborts creation unless exactly one of the latching/momentary
+  // features is already declared, so this cannot be added afterwards. Declaring
+  // it also brings the position attributes and the InitialPress event.
+  config.switch_cluster.feature_flags = cluster::switch_cluster::feature::momentary_switch::get_id();
   if (generic_switch::add(endpoint, &config) != ESP_OK) {
     Serial.println("bridge: generic_switch add failed");
     return false;
   }
-
-  // A click is an event, not an attribute, and the momentary feature plus the
-  // InitialPress event have to be declared explicitly for it to be emitted.
-  cluster_t *sw = cluster::get(endpoint, Switch::Id);
-  cluster::switch_cluster::feature::momentary_switch::add(sw);
-  cluster::switch_cluster::event::create_initial_press(sw);
-  cluster::switch_cluster::attribute::create_current_position(sw, 0);
-  cluster::switch_cluster::attribute::create_number_of_positions(sw, 2);
 
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
@@ -116,9 +117,9 @@ bool BridgedAccessory::beginLight(const char *name, bool on, uint8_t level) {
 
   dimmable_light::config_t config;
   config.on_off.on_off = on;
-  config.on_off.lighting.start_up_on_off = nullptr;
+  config.on_off_lighting.start_up_on_off = nullptr;
   config.level_control.current_level = level;
-  config.level_control.lighting.start_up_current_level = nullptr;
+  config.level_control_lighting.start_up_current_level = nullptr;
   if (dimmable_light::add(endpoint, &config) != ESP_OK) {
     Serial.println("bridge: dimmable_light add failed");
     return false;

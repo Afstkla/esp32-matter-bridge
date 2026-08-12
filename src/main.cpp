@@ -201,6 +201,12 @@ static void runCommand(const String &cmd) {
   } else if (cmd == "pairing") {
     Serial.printf("CODE %s\n", Matter.getManualPairingCode().c_str());
     Serial.printf("QR %s\n", Matter.getOnboardingQRCodeUrl().c_str());
+  } else if (cmd == "window") {
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    CHIP_ERROR err = chip::Server::GetInstance().GetCommissioningWindowManager().OpenBasicCommissioningWindow(
+        chip::System::Clock::Seconds32(180));
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    Serial.printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
   } else if (cmd == "decommission") {
     Matter.decommission();
     Serial.println("DECOMMISSIONED");

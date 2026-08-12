@@ -1,29 +1,125 @@
 # Matter on the Arduino ESP32 core — what bit us
 
-Notes from building this firmware against arduino-esp32 3.1.3 / pioarduino
-53.03.13 on an ESP32-S3. Each of these cost real debugging time and none of
-them are obvious from the documentation.
+Notes from building this firmware against arduino-esp32 3.3.11 / pioarduino
+55.03.311 on an ESP32-S3, and from the 3.1.3 era before it. Each of these cost
+real debugging time and none of them are obvious from the documentation.
 
-## There is no BLE commissioning
+## A bridged accessory costs 53 KB of internal RAM
 
-The prebuilt Arduino libs are compiled **without** `CONFIG_ENABLE_CHIPOBLE`:
+The most expensive bug in the project, because nothing points at the cause.
+
+Naming a bridged accessory is one line:
+
+```cpp
+cluster::bridged_device_basic_information::attribute::create_node_label(info, _name, 32);
+```
+
+On esp_matter 1.5 that call allocates **53,316 bytes of internal DRAM**. The
+32-byte name is not the reason. The helper hardcodes
+`ATTRIBUTE_FLAG_NONVOLATILE`, and calling `attribute::create()` directly with an
+identical value, identical `max_val_size`, and everything else the same but
+*without* that flag costs **116 bytes**:
+
+```cpp
+esp_matter::attribute::create(info, BridgedDeviceBasicInformation::Attributes::NodeLabel::Id,
+                              ATTRIBUTE_FLAG_WRITABLE, esp_matter_char_str(_name, 32), 32);
+```
+
+Two independent faults have to line up for this to be fatal, which is why it is
+so confusing:
+
+1. The library spends 53 KB persisting a 32-byte string.
+2. The prebuilt Arduino libs set `CONFIG_ESP_MATTER_MEM_ALLOC_MODE_INTERNAL=y`,
+   so `esp_matter_mem_calloc()` is pinned to `MALLOC_CAP_INTERNAL` and **cannot
+   use PSRAM at all**. With 8 MB of PSRAM sitting idle, the waste lands in the
+   one pool that is scarce.
+
+The failure is silent and looks like something else entirely. Three accessories
+drain internal DRAM; allocations for the rest fail quietly and cost ~1.6 KB each
+instead of 53 KB; then WiFi cannot create its task:
+
+```
+E wifi:create wifi task: failed to create task
+E [WiFiGeneric.cpp] wifiLowLevelInit(): esp_wifi_init 0x101: ESP_ERR_NO_MEM
+E bridge: esp_matter start failed (-1)
+```
+
+Nothing mentions attributes or memory limits. Instrument with
+`heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)` around each
+endpoint and the cliff is obvious in one boot.
+
+Dropping `NONVOLATILE` means Matter no longer persists the label. That is fine
+here because the names live in `Preferences` and are reapplied on boot, but a
+label written by a controller will not survive a restart.
+
+## BLE commissioning depends on the core version
+
+On arduino-esp32 **3.1.x** the prebuilt libs are compiled *without*
+`CONFIG_ENABLE_CHIPOBLE`. The CHIPoBLE transport is compiled out, not merely
+disabled — no build flag brings it back:
 
 ```console
 $ grep CHIPOBLE .../framework-arduinoespressif32-libs/esp32s3/sdkconfig
 # CONFIG_ENABLE_CHIPOBLE is not set
 ```
 
-The CHIPoBLE transport is *compiled out*, not merely disabled — no build flag
-brings it back. So the familiar Matter flow, where the phone finds the
-accessory over Bluetooth and hands it WiFi credentials, cannot happen.
+Commissioning there is **on-network only**: the device must already hold WiFi
+credentials, join, and publish `_matterc._udp` for a commissioner to find it.
+This is why every Arduino Matter example calls `WiFi.begin()` and blocks until
+connected *before* `Matter.begin()`. Symptom if you miss it: pairing times out
+with no useful error at either end.
 
-Commissioning is **on-network only**: the device must already hold WiFi
-credentials, join, and publish `_matterc._udp` over mDNS for a commissioner to
-find it. This is why every Arduino Matter example calls `WiFi.begin()` and
-blocks until connected *before* `Matter.begin()`.
+On **3.3.x** it is enabled out of the box, on NimBLE rather than Bluedroid:
 
-Symptom if you miss it: pairing simply times out, with no useful error at
-either end.
+```console
+$ grep -E "CHIPOBLE|NIMBLE" .../esp32s3/sdkconfig
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_ENABLE_CHIPOBLE=y
+```
+
+So the fix for "no BLE commissioning" is to upgrade the core, not to rebuild the
+libraries. Rebuilding them with `CONFIG_ENABLE_CHIPOBLE=y` on 3.1.x does work,
+but Bluedroid's CHIPoBLE path is unmaintained and needs three source fixes
+before it compiles and advertises — an upgrade avoids all of them, because the
+NimBLE path is the one Espressif actually build and test.
+
+Do not trust `ble_adv` in `diag` either way — it reports
+`IsBLEAdvertisingEnabled()`, the stack's intent, and reads 1 even when the
+controller refused the parameters. Verify with a BLE scan for service data under
+UUID `0xFFF6`; the payload carries the discriminator and the vendor and product
+IDs, so you can match it against the `_matterc._udp` record.
+
+## Moving from esp_matter 1.3.0 to 1.5
+
+Four changes, all in endpoint construction:
+
+- `on_off.lighting` and `level_control.lighting` moved out of the cluster
+  configs into sibling members `on_off_lighting` and `level_control_lighting`.
+  `= nullptr` still compiles but changed meaning: it used to say "do not create
+  this attribute", now it says "the attribute exists and its value is null".
+  The new default is `0`, which forces the light off at boot.
+- The switch cluster validates features at create time
+  (`VALIDATE_FEATURES_EXACT_ONE`), so the momentary feature must be declared in
+  the config rather than added afterwards. It aborts the cluster otherwise, and
+  the device reboots in a loop:
+
+  ```
+  E esp_matter_cluster: Exactly one of the feature(s) must be supported from (Latching Switch,Momentary Switch)
+  assert failed: ABORT_CLUSTER_CREATE
+  ```
+
+  ```cpp
+  config.switch_cluster.feature_flags = cluster::switch_cluster::feature::momentary_switch::get_id();
+  ```
+- Declaring that feature also creates `NumberOfPositions`, `CurrentPosition` and
+  the `InitialPress` event, so the explicit calls for those become duplicates.
+- `create_node_label()` — see the memory section above.
+
+Do not expect to bump esp_matter on its own. Its version is pinned by the
+Arduino core: 3.1.x pins `esp_insights` to exactly `1.0.1` (to match Matter of
+that era), and esp_matter 1.3.1+ requires `1.2.2`, so nothing above 1.3.0 will
+resolve. 3.2.x bumps Insights and 3.3.x ships esp_matter 1.5. The unit of
+upgrade is the core, not the component.
 
 ## Progress logging does not exist
 
@@ -50,7 +146,7 @@ DIAG t=1s ble_adv=0 window=1 wifi_prov=0 wifi_conn=0 fabrics=0
 - `ll6` — Matter's operational traffic is IPv6-only; `::` means unreachable
 - `fabrics` — did a controller actually join
 
-`ble_adv=0` is permanent and expected here, per the section above.
+`ble_adv=0` is permanent and expected on a 3.1.x core, per the section above.
 
 ## A data partition must not cover 0xE000
 
@@ -192,3 +288,8 @@ which read as a failure and sent us chasing a bug that did not exist.
 - The ESP32-S3 talks USB-Serial-JTAG, which gates its output on DTR. Clearing
   DTR to avoid a reset on connect does not avoid the reset — it just makes the
   device go silent.
+- Download mode is sticky across the RTS reset that esptool ends an upload
+  with, so the app never starts and the port goes quiet. `esptool --after
+  watchdog-reset` leaves download mode properly; without it the only way out is
+  a real power-off, and on a board with a battery attached, unplugging USB is
+  not one.

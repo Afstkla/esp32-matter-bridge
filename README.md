@@ -35,7 +35,9 @@ Nothing else is required. Buttons use the two keys already on the board:
 pio run -e matter-amoled-1-8 -t upload
 ```
 
-Then give it WiFi. Credentials live in NVS and never enter the source tree:
+Then give it WiFi. Credentials live in NVS and never enter the source tree.
+(The device also advertises over BLE for commissioning, so a controller can
+provision it instead — but the serial route is easier to script.)
 
 ```sh
 uv run --with pyserial python tools/mctl.py 'ssid My Network' 'pass my-passphrase'
@@ -87,6 +89,7 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | `on N 0\|1`, `level N 0-255` | drive a level accessory |
 | `ssid <name>`, `pass <key>`, `wifi`, `forget` | WiFi credentials |
 | `pairing`, `state`, `decommission` | Matter commissioning |
+| `window` | reopen a 3-minute commissioning window without unpairing |
 | `sleep`, `wake`, `idle N` | screen |
 | `nvs`, `power`, `touchdump` | diagnostics |
 
@@ -115,9 +118,15 @@ encoding is a switch press per step.
 Notes for anyone doing Matter on the Arduino ESP32 core — each of these cost
 real debugging time. Longer write-up in [docs/matter-notes.md](docs/matter-notes.md).
 
-- **There is no BLE commissioning.** The prebuilt Arduino libs are built
-  without `CONFIG_ENABLE_CHIPOBLE`, so the usual "phone hands the device its
-  WiFi credentials" flow does not exist. The device must already be on WiFi.
+- **A bridged accessory costs 53 KB of internal RAM on esp_matter 1.5** if you
+  name it with `create_node_label()`. That helper forces
+  `ATTRIBUTE_FLAG_NONVOLATILE`, and the flag — not the 32-byte name — is what
+  allocates. Three accessories exhaust internal DRAM, after which WiFi cannot
+  start and `esp_matter::start()` fails. Create the attribute directly instead.
+- **BLE commissioning depends on the core version.** arduino-esp32 3.1.x ships
+  its libs without `CONFIG_ENABLE_CHIPOBLE`, so the "phone hands the device its
+  WiFi credentials" flow does not exist there at all. 3.3.x enables it on
+  NimBLE out of the box — see [docs/matter-notes.md](docs/matter-notes.md).
 - **Do not let a data partition cover `0xE000`.** The upload tool writes
   `boot_app0.bin` to that fixed offset regardless of the partition CSV.
 - **`Matter.begin()` cannot start a bridge.** It requires a private flag that
