@@ -288,8 +288,3 @@ which read as a failure and sent us chasing a bug that did not exist.
 - The ESP32-S3 talks USB-Serial-JTAG, which gates its output on DTR. Clearing
   DTR to avoid a reset on connect does not avoid the reset — it just makes the
   device go silent.
-- Download mode is sticky across the RTS reset that esptool ends an upload
-  with, so the app never starts and the port goes quiet. `esptool --after
-  watchdog-reset` leaves download mode properly; without it the only way out is
-  a real power-off, and on a board with a battery attached, unplugging USB is
-  not one.
