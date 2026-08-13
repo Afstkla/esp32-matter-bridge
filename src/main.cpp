@@ -183,6 +183,11 @@ static void runCommand(const String &cmd) {
                     cmd.substring(space + 1).toInt() != 0);
   } else if (cmd.startsWith("remove ")) {
     builderRemove((uint8_t)cmd.substring(7).toInt());
+  } else if (cmd == "swipe left" || cmd == "swipe right") {
+    uint32_t at = millis();
+    builderSwipe(cmd.endsWith("left") ? 1 : -1);
+    Serial.printf("SWIPE %s %lums\n", cmd.endsWith("left") ? "left" : "right",
+                  (unsigned long)(millis() - at));
   } else if (cmd == "reset slots") {
     builderReset();
   } else if (cmd == "add button") {
@@ -301,8 +306,10 @@ static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
   int16_t dx = x - x0;
   int16_t dy = y - y0;
   if (abs(dx) >= SWIPE_MIN_DX && abs(dx) > abs(dy)) {
-    Serial.printf("SWIPE %s\n", dx < 0 ? "left" : "right");
+    uint32_t at = millis();
     builderSwipe(dx < 0 ? 1 : -1);
+    Serial.printf("SWIPE %s %lums\n", dx < 0 ? "left" : "right",
+                  (unsigned long)(millis() - at));
     return;
   }
   if (abs(dx) > TAP_MAX_DRIFT || abs(dy) > TAP_MAX_DRIFT) {

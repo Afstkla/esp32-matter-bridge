@@ -393,7 +393,7 @@ static void drawCentred(int16_t y, const char *text, uint8_t size, uint16_t colo
   drawText((PANEL_W - (int16_t)strlen(text) * 6 * size) / 2, y, text, size, colour);
 }
 
-static void drawPageDots() {
+static void drawPageDots(uint8_t current) {
   uint8_t pages = pageCount();
   if (pages < 2) {
     return;
@@ -403,23 +403,36 @@ static void drawPageDots() {
   int16_t x = (PANEL_W - (pages - 1) * spacing) / 2;
   for (uint8_t page = 0; page < pages; page++) {
     g.fillCircle(x + page * spacing, PANEL_H - 44, 4,
-                 page == s_page ? RGB565_WHITE : RGB565(70, 70, 80));
+                 page == current ? RGB565_WHITE : RGB565(70, 70, 80));
   }
 }
 
-static void drawList() {
+// Everything that does not travel with the pages. Keeping it still during a
+// slide is both cheaper and closer to how a paged home screen behaves.
+static void drawChrome(uint8_t current) {
   Arduino_Canvas &g = panelCanvas();
-  g.fillScreen(RGB565_BLACK);
   drawText(14, 24, "Accessories", 2, RGB565_WHITE);
   g.fillCircle(PANEL_W - 24, 30, 7,
                Matter.isDeviceCommissioned() ? RGB565(90, 220, 130) : RGB565(230, 90, 90));
+  drawPageDots(current);
 
+  char hint[40];
+  snprintf(hint, sizeof(hint), "BOOT +/- PWR  %s", builderActiveLevelLabel());
+  drawCentred(PANEL_H - 22, hint, 1, COL_FAINT);
+}
+
+static void drawTiles(uint8_t page, int16_t dx) {
+  Arduino_Canvas &g = panelCanvas();
   uint8_t used[MAX_SLOTS];
   uint8_t count = usedSlots(used);
-  uint8_t first = s_page * PER_PAGE;
+  uint8_t first = page * PER_PAGE;
   for (uint8_t i = first; i < tileCount() && i < first + PER_PAGE; i++) {
     int16_t x, y;
     tileRect(i, &x, &y);
+    x += dx;
+    if (x + TILE_W <= 0 || x >= PANEL_W) {
+      continue;
+    }
 
     if (i >= count) {
       g.drawRoundRect(x, y, TILE_W, TILE_H, 12, RGB565(70, 70, 80));
@@ -441,12 +454,12 @@ static void drawList() {
     }
     drawText(x + 12, y + 62, detail, 1, COL_MUTED);
   }
+}
 
-  drawPageDots();
-
-  char hint[40];
-  snprintf(hint, sizeof(hint), "BOOT +/- PWR  %s", builderActiveLevelLabel());
-  drawCentred(PANEL_H - 22, hint, 1, COL_FAINT);
+static void drawList() {
+  panelCanvas().fillScreen(RGB565_BLACK);
+  drawChrome(s_page);
+  drawTiles(s_page, 0);
 }
 
 static void drawAdd() {
@@ -517,12 +530,30 @@ static void cycleName(uint8_t slot) {
   Serial.printf("NAME %u %s\n", slot, builderLabel(slot));
 }
 
+// Eased travel, as a percentage of the screen width. The last step is the
+// normal redraw the caller triggers, so the list stops at 100 without paying
+// for a frame that draws two pages.
+static const uint8_t SLIDE_STEPS[] = {34, 60, 79, 92};
+
 void builderSwipe(int8_t direction) {
   uint8_t pages = pageCount();
   if (s_addOpen || s_openSlot >= 0 || pages < 2) {
     return;
   }
-  s_page = (uint8_t)((s_page + pages + direction) % pages);
+  uint8_t from = s_page;
+  uint8_t to = (uint8_t)((s_page + pages + direction) % pages);
+
+  for (uint8_t step = 0; step < sizeof(SLIDE_STEPS) / sizeof(SLIDE_STEPS[0]); step++) {
+    int16_t travelled = (int16_t)((int32_t)PANEL_W * SLIDE_STEPS[step] / 100);
+    int16_t offset = direction > 0 ? -travelled : travelled;
+    panelCanvas().fillScreen(RGB565_BLACK);
+    drawChrome(to);
+    drawTiles(from, offset);
+    drawTiles(to, direction > 0 ? offset + PANEL_W : offset - PANEL_W);
+    panelFlush();
+  }
+
+  s_page = to;
   s_dirty = true;
 }
 

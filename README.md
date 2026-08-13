@@ -55,7 +55,8 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
 ## Using it
 
 - **Tile grid** — one tile per accessory, six to a page. **Swipe left or right**
-  to change page; the dots at the bottom show where you are.
+  to change page; the pages slide across (~200 ms) and the dots at the bottom
+  show where you are.
 - **`+` tile** — add a button or a level. It appears in Home within a second or
   two; no restart.
 - **Tap an accessory** — press it, toggle it, or nudge its level ±10%.
@@ -96,6 +97,7 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | `slots` | list accessories |
 | `add button` / `add level` | add an accessory |
 | `remove N` | delete an accessory |
+| `swipe left` / `swipe right` | change page, animation included |
 | `reset slots` | back to the default six (restarts) |
 | `click N` | fire a switch press |
 | `on N 0\|1`, `level N 0-255` | drive a level accessory |
