@@ -62,10 +62,10 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
 - **`+` tile** — add a button or a level, then pick its name. It appears in Home
   within a second or two; no restart.
 - **Tap an accessory** — press it, toggle it, or nudge its level ±10%.
-- **Tap the name** — opens the same name picker. The chosen name is pushed to
-  the accessory's `NodeLabel`, so it reaches Home too. Names already in use are
-  greyed out: duplicates are legal in Matter but miserable to tell apart in the
-  Home app.
+- **Tap the name** — opens the same name picker: the same six-to-a-page grid of
+  tiles, swipe to page through it. Only free names are offered — duplicates are
+  legal in Matter but miserable to tell apart in the Home app. The chosen name
+  is pushed to the accessory's `NodeLabel`, so it reaches Home too.
 - **remove** — top right of an accessory's screen, then tap again to confirm.
 - The screen sleeps after a minute and wakes on touch.
 

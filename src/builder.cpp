@@ -56,6 +56,7 @@ static bool s_confirmRemove = false;
 static bool s_pickOpen = false;
 static int8_t s_pickSlot = -1;  // -1 while choosing the name for a new accessory
 static bool s_pickIsButton = false;
+static uint8_t s_pickPage = 0;
 static uint8_t s_page = 0;
 static uint8_t s_activeLevel = 0;
 
@@ -67,8 +68,6 @@ static const int16_t TILE_X0 = 12;
 static const int16_t TILE_Y0 = 62;
 static const int16_t TILE_GAP = 10;
 static const uint8_t PER_PAGE = 6;
-static const int16_t PICK_Y0 = 62;
-static const int16_t PICK_ROW_H = 34;
 
 uint8_t builderSlotCount() {
   return s_count;
@@ -321,8 +320,14 @@ static uint8_t tileCount() {
   return used < MAX_SLOTS ? (uint8_t)(used + 1) : used;
 }
 
+static uint8_t availablePresets(uint8_t *out);
+
+// Both grids page identically, so a swipe does not care which one is showing.
 static uint8_t pageCount() {
-  return (uint8_t)((tileCount() + PER_PAGE - 1) / PER_PAGE);
+  uint8_t available[PRESET_COUNT];
+  uint16_t cells = s_pickOpen ? availablePresets(available) : tileCount();
+  uint8_t pages = (uint8_t)((cells + PER_PAGE - 1) / PER_PAGE);
+  return pages < 1 ? 1 : pages;
 }
 
 // The slot is emptied rather than reclaimed: startAccessory() would otherwise
@@ -415,14 +420,18 @@ static void drawPageDots(uint8_t current) {
 // slide is both cheaper and closer to how a paged home screen behaves.
 static void drawChrome(uint8_t current) {
   Arduino_Canvas &g = panelCanvas();
-  drawText(14, 24, "Accessories", 2, COL_WHITE);
-  g.fillCircle(PANEL_W - 24, 30, 7,
-               Matter.isDeviceCommissioned() ? COL_OK : COL_ALERT);
-  drawPageDots(current);
+  if (s_pickOpen) {
+    drawText(16, 24, "< back", 2, COL_MUTED);
+    drawCentred(PANEL_H - 22, "pick a name", 1, COL_FAINT);
+  } else {
+    drawText(14, 24, "Accessories", 2, COL_WHITE);
+    g.fillCircle(PANEL_W - 24, 30, 7, Matter.isDeviceCommissioned() ? COL_OK : COL_ALERT);
 
-  char hint[40];
-  snprintf(hint, sizeof(hint), "BOOT +/- PWR  %s", builderActiveLevelLabel());
-  drawCentred(PANEL_H - 22, hint, 1, COL_FAINT);
+    char hint[40];
+    snprintf(hint, sizeof(hint), "BOOT +/- PWR  %s", builderActiveLevelLabel());
+    drawCentred(PANEL_H - 22, hint, 1, COL_FAINT);
+  }
+  drawPageDots(current);
 }
 
 static void drawTiles(uint8_t page, int16_t dx) {
@@ -467,7 +476,7 @@ static void drawList() {
 }
 
 // Two accessories sharing a name is legal but miserable to tell apart in the
-// Home app, so a name already spoken for is shown but cannot be picked.
+// Home app, so a name already spoken for is not offered.
 static bool presetTaken(uint8_t preset, int8_t exceptSlot) {
   for (uint8_t slot = 0; slot < s_count; slot++) {
     if ((int8_t)slot == exceptSlot || !builderSlotUsed(slot)) {
@@ -480,26 +489,41 @@ static bool presetTaken(uint8_t preset, int8_t exceptSlot) {
   return false;
 }
 
-static void pickCell(uint8_t index, int16_t *x, int16_t *y) {
-  *x = TILE_X0 + (index % 2) * (TILE_W + TILE_GAP);
-  *y = PICK_Y0 + (index / 2) * PICK_ROW_H;
+static uint8_t availablePresets(uint8_t *out) {
+  uint8_t n = 0;
+  for (uint8_t preset = 0; preset < PRESET_COUNT; preset++) {
+    if (!presetTaken(preset, s_pickSlot)) {
+      out[n++] = preset;
+    }
+  }
+  return n;
+}
+
+// Same geometry as the accessory grid, because a name needs as much of a
+// finger's worth of tile as an accessory does.
+static void drawNameTiles(uint8_t page, int16_t dx) {
+  Arduino_Canvas &g = panelCanvas();
+  uint8_t available[PRESET_COUNT];
+  uint8_t count = availablePresets(available);
+  uint8_t first = page * PER_PAGE;
+  for (uint8_t i = first; i < count && i < first + PER_PAGE; i++) {
+    int16_t x, y;
+    tileRect(i, &x, &y);
+    x += dx;
+    if (x + TILE_W <= 0 || x >= PANEL_W) {
+      continue;
+    }
+    const char *name = PRESETS[available[i]];
+    g.fillRoundRect(x, y, TILE_W, TILE_H, 12, COL_BG);
+    g.drawRoundRect(x, y, TILE_W, TILE_H, 12, COL_OUTLINE);
+    drawText(x + (TILE_W - (int16_t)strlen(name) * 12) / 2, y + 42, name, 2, COL_WHITE);
+  }
 }
 
 static void drawPicker() {
-  Arduino_Canvas &g = panelCanvas();
-  g.fillScreen(COL_BLACK);
-  drawText(16, 24, "< back", 2, COL_MUTED);
-
-  for (uint8_t preset = 0; preset < PRESET_COUNT; preset++) {
-    int16_t x, y;
-    pickCell(preset, &x, &y);
-    bool mine = s_pickSlot >= 0 && s_slot[s_pickSlot].preset == preset;
-    if (mine) {
-      g.fillRoundRect(x, y, TILE_W, PICK_ROW_H - 4, 8, COL_BG);
-    }
-    drawText(x + 12, y + 8, PRESETS[preset], 2,
-             presetTaken(preset, s_pickSlot) ? COL_OUTLINE : COL_WHITE);
-  }
+  panelCanvas().fillScreen(COL_BLACK);
+  drawChrome(s_pickPage);
+  drawNameTiles(s_pickPage, 0);
 }
 
 static void drawAdd() {
@@ -571,24 +595,34 @@ static bool inRect(int16_t x, int16_t y, int16_t rx, int16_t ry, int16_t rw, int
 static const uint8_t SLIDE_STEPS[] = {34, 60, 79, 92};
 
 void builderSwipe(int8_t direction) {
-  uint8_t pages = pageCount();
-  if (!builderAtRoot() || pages < 2) {
+  if (s_addOpen || (!s_pickOpen && s_openSlot >= 0)) {
     return;
   }
-  uint8_t from = s_page;
-  uint8_t to = (uint8_t)((s_page + pages + direction) % pages);
+  uint8_t pages = pageCount();
+  if (pages < 2) {
+    return;
+  }
+  uint8_t *page = s_pickOpen ? &s_pickPage : &s_page;
+  uint8_t from = *page;
+  uint8_t to = (uint8_t)((*page + pages + direction) % pages);
 
   for (uint8_t step = 0; step < sizeof(SLIDE_STEPS) / sizeof(SLIDE_STEPS[0]); step++) {
     int16_t travelled = (int16_t)((int32_t)PANEL_W * SLIDE_STEPS[step] / 100);
     int16_t offset = direction > 0 ? -travelled : travelled;
+    int16_t incoming = direction > 0 ? offset + PANEL_W : offset - PANEL_W;
     panelCanvas().fillScreen(COL_BLACK);
     drawChrome(to);
-    drawTiles(from, offset);
-    drawTiles(to, direction > 0 ? offset + PANEL_W : offset - PANEL_W);
+    if (s_pickOpen) {
+      drawNameTiles(from, offset);
+      drawNameTiles(to, incoming);
+    } else {
+      drawTiles(from, offset);
+      drawTiles(to, incoming);
+    }
     panelFlush();
   }
 
-  s_page = to;
+  *page = to;
   s_dirty = true;
 }
 
@@ -623,15 +657,16 @@ static void touchPicker(int16_t x, int16_t y) {
     return;
   }
 
-  for (uint8_t preset = 0; preset < PRESET_COUNT; preset++) {
+  uint8_t available[PRESET_COUNT];
+  uint8_t count = availablePresets(available);
+  uint8_t first = s_pickPage * PER_PAGE;
+  for (uint8_t i = first; i < count && i < first + PER_PAGE; i++) {
     int16_t cx, cy;
-    pickCell(preset, &cx, &cy);
-    if (!inRect(x, y, cx, cy, TILE_W, PICK_ROW_H)) {
+    tileRect(i, &cx, &cy);
+    if (!inRect(x, y, cx, cy, TILE_W, TILE_H)) {
       continue;
     }
-    if (presetTaken(preset, s_pickSlot)) {
-      return;
-    }
+    uint8_t preset = available[i];
     s_pickOpen = false;
     if (s_pickSlot < 0) {
       builderAdd(s_pickIsButton, preset);
@@ -659,6 +694,7 @@ static void touchAdd(int16_t x, int16_t y) {
   }
   s_pickIsButton = isButton;
   s_pickSlot = -1;
+  s_pickPage = 0;
   s_addOpen = false;
   s_pickOpen = true;
   s_dirty = true;
@@ -688,6 +724,7 @@ static void touchDetail(uint8_t slot, int16_t x, int16_t y) {
   }
   if (inRect(x, y, 40, 56, 288, 40)) {
     s_pickSlot = (int8_t)slot;
+    s_pickPage = 0;
     s_pickOpen = true;
     s_dirty = true;
     return;
