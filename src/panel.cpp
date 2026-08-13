@@ -100,7 +100,7 @@ bool panelInit() {
     Serial.println("panel: PSRAM framebuffer alloc failed");
     return false;
   }
-  if (!s_canvas->begin()) {
+  if (!s_canvas->begin(80000000)) {
     Serial.println("panel: canvas begin failed");
     return false;
   }

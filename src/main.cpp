@@ -181,6 +181,8 @@ static void runCommand(const String &cmd) {
     }
     builderSetOnOff((uint8_t)cmd.substring(3, space).toInt(),
                     cmd.substring(space + 1).toInt() != 0);
+  } else if (cmd.startsWith("remove ")) {
+    builderRemove((uint8_t)cmd.substring(7).toInt());
   } else if (cmd == "reset slots") {
     builderReset();
   } else if (cmd == "add button") {
@@ -189,6 +191,9 @@ static void runCommand(const String &cmd) {
     builderAdd(false);
   } else if (cmd == "slots") {
     for (uint8_t i = 0; i < builderSlotCount(); i++) {
+      if (!builderSlotUsed(i)) {
+        continue;
+      }
       Serial.printf("SLOT %u %s %s %u on=%d\n", i, builderIsButton(i) ? "button" : "level",
                     builderLabel(i), builderLevel(i), builderOnOff(i) ? 1 : 0);
     }
@@ -280,32 +285,63 @@ static void pollKeys() {
   builderNudgeLevel(up ? 1 : -1);
 }
 
+// Acting on release rather than on contact is what makes a swipe possible at
+// all: until the finger lifts there is no way to tell one from a tap.
+static const int16_t SWIPE_MIN_DX = 50;
+static const int16_t TAP_MAX_DRIFT = 24;
+
+static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
+  // The tap that wakes the screen must not also hit whatever was underneath it.
+  if (panelAsleep()) {
+    panelWake();
+    drawScreen();
+    return;
+  }
+
+  int16_t dx = x - x0;
+  int16_t dy = y - y0;
+  if (abs(dx) >= SWIPE_MIN_DX && abs(dx) > abs(dy)) {
+    Serial.printf("SWIPE %s\n", dx < 0 ? "left" : "right");
+    builderSwipe(dx < 0 ? 1 : -1);
+    return;
+  }
+  if (abs(dx) > TAP_MAX_DRIFT || abs(dy) > TAP_MAX_DRIFT) {
+    return;
+  }
+
+  Serial.printf("TAP %d %d\n", x0, y0);
+  if (s_showQr) {
+    s_showQr = false;
+    drawScreen();
+  } else if (x0 > PANEL_W - 60 && y0 < 60) {
+    s_showQr = true;
+    drawScreen();
+  } else {
+    builderTouch(x0, y0);
+  }
+}
+
 static void pollTouch() {
   static bool wasDown = false;
+  static int16_t downX = 0, downY = 0;
+  static int16_t lastX = 0, lastY = 0;
   static uint32_t lastAt = 0;
 
   int16_t x = 0, y = 0;
   bool down = panelTouch(&x, &y);
-  if (down && !wasDown && millis() - lastAt > 180) {
+
+  if (down) {
+    noteActivity();
+    if (!wasDown) {
+      downX = x;
+      downY = y;
+    }
+    lastX = x;
+    lastY = y;
+  } else if (wasDown && millis() - lastAt > 120) {
     lastAt = millis();
     noteActivity();
-    Serial.printf("TOUCH %d %d\n", x, y);
-    // The tap that wakes the screen must not also hit whatever was underneath it.
-    if (panelAsleep()) {
-      panelWake();
-      drawScreen();
-      wasDown = down;
-      return;
-    }
-    if (s_showQr) {
-      s_showQr = false;
-      drawScreen();
-    } else if (x > PANEL_W - 60 && y < 60) {
-      s_showQr = true;
-      drawScreen();
-    } else {
-      builderTouch(x, y);
-    }
+    handleRelease(downX, downY, lastX, lastY);
   }
   wasDown = down;
 }
@@ -321,8 +357,9 @@ void setup() {
   keysInit();
 
   builderBegin();
-  netcfgJoin(20000);
+  netcfgJoin(0);
   bridgeStart();
+  builderResume();
 
   s_showQr = !Matter.isDeviceCommissioned();
   if (!Matter.isDeviceCommissioned()) {
@@ -335,9 +372,12 @@ void setup() {
 
 void loop() {
   static bool lastCommissioned = false;
+  static bool lastOnline = false;
   bool commissioned = Matter.isDeviceCommissioned();
-  if (commissioned != lastCommissioned) {
+  bool online = WiFi.status() == WL_CONNECTED;
+  if (commissioned != lastCommissioned || online != lastOnline) {
     lastCommissioned = commissioned;
+    lastOnline = online;
     if (commissioned) {
       s_showQr = false;
     }

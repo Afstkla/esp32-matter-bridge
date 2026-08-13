@@ -203,38 +203,80 @@ QR) keep working too — none of them check that flag.
 
 ```cpp
 bridged_node::create(node, &config, ENDPOINT_FLAG_DESTROYABLE | ENDPOINT_FLAG_BRIDGE, this);
-generic_switch::add(endpoint, &switchConfig);   // or dimmable_light::add
 endpoint::set_parent_endpoint(endpoint, aggregator);
-cluster::bridged_device_basic_information::attribute::create_node_label(info, name, len);
+generic_switch::add(endpoint, &switchConfig);   // or dimmable_light::add
+endpoint::enable(endpoint);                     // required after startup
 ```
 
-Two traps:
+Traps:
 
 - The `NodeLabel` buffer must outlive the call — the attribute keeps
-  referencing it, so a local will dangle. Make it a member.
-- **A switch click is an event, not an attribute.** `generic_switch::add()`
-  does not bring it. You must also add `momentary_switch::add()`,
-  `create_initial_press()`, `create_current_position()` and
-  `create_number_of_positions()`, then send from
+  referencing it, so a local will dangle. Make it a member. That also means an
+  array of accessories cannot be compacted while the stack runs: the endpoint's
+  `priv_data` points at the object too.
+- Use `attribute::create()` rather than `create_node_label()` — see the memory
+  section above.
+- **A switch click is an event, not an attribute.** Declaring the momentary
+  feature in the config brings `NumberOfPositions`, `CurrentPosition` and the
+  `InitialPress` event with it; send from
   `SystemLayer().ScheduleLambda(send_initial_press(...))`.
+- `endpoint::destroy()` takes the stack lock itself, but as a
+  `ScopedChipStackLock`, which is a no-op when the calling thread already holds
+  it (`CHIP_STACK_LOCK_TRACKING_ENABLED` is on in these libs). Calling it from
+  inside your own lock is safe; without that tracking it would deadlock.
 
-## Endpoint IDs and `resume()`
+## Endpoint IDs: build the bridge *after* `esp_matter::start()`
 
-Endpoints created at boot are numbered sequentially in creation order, so an
-append-only accessory list yields stable IDs. An endpoint created *while the
-stack runs* takes the next free ID instead, which will not match what a cold
-boot assigns it — so it changes identity on restart and controllers re-add it.
+The obvious arrangement — create every endpoint, then start the stack — is the
+one that makes runtime changes impossible. Getting it the other way round is
+what lets a bridge add an accessory without rebooting.
 
-`bridged_node::resume()` looks like the answer but fails with:
+Endpoint IDs come from a single counter:
 
+```cpp
+endpoint->endpoint_id = current_node->min_unused_endpoint_id++;
+if (esp_matter::is_started()) {
+    node::store_min_unused_endpoint_id();   // NVS, but only once started
+}
 ```
-E esp_matter_core: The endpoint_id of the resumed endpoint should have been used
+
+Two consequences that are easy to get wrong:
+
+- **The counter is persisted, but only by endpoints created after the stack
+  starts.** Endpoints created before it are numbered 1, 2, 3… from scratch on
+  every boot, and never write the counter back.
+- **`start()` overwrites the in-RAM counter** with the stored value. So the
+  pre-start numbering and the stored counter drift apart, and an accessory added
+  at runtime gets an ID far above the pre-start sequence. Ours took 13 where a
+  cold boot would have given it 10 — the accessory changes identity on the next
+  restart and controllers re-add it.
+
+`bridged_node::resume()` is the fix, but only from the right side of `start()`:
+
+```cpp
+VerifyOrReturnError(endpoint_id < current_node->min_unused_endpoint_id, NULL,
+                    ESP_LOGE(TAG, "The endpoint_id of the resumed endpoint should have been used"));
 ```
 
-It validates against esp_matter's own allocation counter and cannot claim an ID
-the current session has not yet reached. The workable approach is to persist
-the accessory list and restart after adding, so everything is recreated in
-order.
+Called before `start()`, the counter is still climbing from 1 and any real
+stored ID fails that check — which is what makes `resume()` look broken. After
+`start()` the counter holds the restored value, every stored ID is below it, and
+`resume()` works. There is no ordering requirement between resumed endpoints.
+
+So the working shape is:
+
+1. Create the node and aggregator, then `esp_matter::start()`.
+2. For each saved accessory, `bridged_node::resume(node, &config, flags, storedId, priv)`,
+   falling back to `create()` when there is no stored ID.
+3. `endpoint::enable(endpoint)` on each — `resume()` leaves `enabled` false, and
+   an endpoint built after startup is not registered with CHIP otherwise.
+4. Persist whatever ID came back.
+
+Every data-model write once the stack is up must hold `PlatformMgr().LockChipStack()`.
+
+Adding an accessory then costs nothing but the same four steps, and its ID
+survives the next boot. IDs may end up with gaps (ours run 2–10, then 14);
+nothing requires them to be contiguous.
 
 ## Verifying commissioning from a Mac
 

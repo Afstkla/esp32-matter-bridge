@@ -57,9 +57,52 @@ bool bridgeStart() {
   return true;
 }
 
+// Endpoints built before esp_matter::start() are registered by the stack as it
+// comes up. One built afterwards has to be enabled by hand, and every
+// data-model write while the stack runs has to hold its lock.
+namespace {
+class LiveEdit {
+public:
+  LiveEdit() : _live(esp_matter::is_started()) {
+    if (_live) {
+      chip::DeviceLayer::PlatformMgr().LockChipStack();
+    }
+  }
+  ~LiveEdit() {
+    if (_live) {
+      chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    }
+  }
+  bool live() const {
+    return _live;
+  }
+
+private:
+  bool _live;
+};
+}  // namespace
+
+static bool publish(esp_matter::endpoint_t *endpoint, const LiveEdit &edit) {
+  if (!edit.live()) {
+    return true;
+  }
+  esp_err_t err = endpoint::enable(endpoint);
+  if (err != ESP_OK) {
+    Serial.printf("bridge: endpoint enable failed (%d)\n", err);
+    return false;
+  }
+  return true;
+}
+
 // The name buffer is a member rather than a local because the attribute keeps
 // referring to it, and it is sized once here so later renames always fit.
-endpoint_t *BridgedAccessory::createNode(const char *name) {
+//
+// An accessory reclaims the endpoint id it had last time. That only works after
+// esp_matter::start() has restored its min-unused-endpoint-id counter from NVS,
+// because resume() refuses any id the counter has not passed yet. Falling back
+// to create() covers a first run and a wiped counter; the caller persists
+// whichever id came back.
+endpoint_t *BridgedAccessory::createNode(const char *name, uint16_t endpointId) {
   if (s_aggregator == nullptr) {
     Serial.println("bridge: begin the aggregator first");
     return nullptr;
@@ -67,9 +110,17 @@ endpoint_t *BridgedAccessory::createNode(const char *name) {
   strlcpy(_name, name, sizeof(_name));
 
   bridged_node::config_t config;
-  endpoint_t *endpoint = bridged_node::create(node::get(), &config,
-                                              ENDPOINT_FLAG_DESTROYABLE | ENDPOINT_FLAG_BRIDGE,
-                                              (void *)this);
+  const uint8_t flags = ENDPOINT_FLAG_DESTROYABLE | ENDPOINT_FLAG_BRIDGE;
+  endpoint_t *endpoint = nullptr;
+  if (endpointId != 0) {
+    endpoint = bridged_node::resume(node::get(), &config, flags, endpointId, (void *)this);
+    if (endpoint == nullptr) {
+      Serial.printf("bridge: endpoint %u could not be resumed, taking a new one\n", endpointId);
+    }
+  }
+  if (endpoint == nullptr) {
+    endpoint = bridged_node::create(node::get(), &config, flags, (void *)this);
+  }
   if (endpoint == nullptr) {
     Serial.println("bridge: bridged node create failed");
     return nullptr;
@@ -87,8 +138,9 @@ endpoint_t *BridgedAccessory::createNode(const char *name) {
   return endpoint;
 }
 
-bool BridgedAccessory::beginSwitch(const char *name) {
-  endpoint_t *endpoint = createNode(name);
+bool BridgedAccessory::beginSwitch(const char *name, uint16_t endpointId) {
+  LiveEdit edit;
+  endpoint_t *endpoint = createNode(name, endpointId);
   if (endpoint == nullptr) {
     return false;
   }
@@ -102,6 +154,9 @@ bool BridgedAccessory::beginSwitch(const char *name) {
     Serial.println("bridge: generic_switch add failed");
     return false;
   }
+  if (!publish(endpoint, edit)) {
+    return false;
+  }
 
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
@@ -109,8 +164,9 @@ bool BridgedAccessory::beginSwitch(const char *name) {
   return true;
 }
 
-bool BridgedAccessory::beginLight(const char *name, bool on, uint8_t level) {
-  endpoint_t *endpoint = createNode(name);
+bool BridgedAccessory::beginLight(const char *name, bool on, uint8_t level, uint16_t endpointId) {
+  LiveEdit edit;
+  endpoint_t *endpoint = createNode(name, endpointId);
   if (endpoint == nullptr) {
     return false;
   }
@@ -124,12 +180,37 @@ bool BridgedAccessory::beginLight(const char *name, bool on, uint8_t level) {
     Serial.println("bridge: dimmable_light add failed");
     return false;
   }
+  if (!publish(endpoint, edit)) {
+    return false;
+  }
 
   _on = on;
   _level = level;
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
   Serial.printf("bridge: light '%s' on endpoint %u\n", _name, getEndPointId());
+  return true;
+}
+
+bool BridgedAccessory::remove() {
+  if (!_started) {
+    return false;
+  }
+  LiveEdit edit;
+  endpoint_t *endpoint = endpoint::get(node::get(), getEndPointId());
+  if (endpoint == nullptr) {
+    Serial.printf("bridge: endpoint %u not found\n", getEndPointId());
+    return false;
+  }
+  esp_err_t err = endpoint::destroy(node::get(), endpoint);
+  if (err != ESP_OK) {
+    Serial.printf("bridge: endpoint destroy failed (%d)\n", err);
+    return false;
+  }
+  Serial.printf("bridge: removed '%s' from endpoint %u\n", _name, getEndPointId());
+  _started = false;
+  _onOffCB = nullptr;
+  _levelCB = nullptr;
   return true;
 }
 

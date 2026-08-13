@@ -18,8 +18,13 @@ bool bridgeStart();
 
 class BridgedAccessory : public MatterEndPoint {
 public:
-  bool beginSwitch(const char *name);
-  bool beginLight(const char *name, bool on, uint8_t level);
+  // endpointId is the id this accessory held last time, or 0 for a new one.
+  bool beginSwitch(const char *name, uint16_t endpointId);
+  bool beginLight(const char *name, bool on, uint8_t level, uint16_t endpointId);
+
+  // Destroys the Matter endpoint. The accessory goes inert; the slot it came
+  // from is the caller's to free.
+  bool remove();
 
   void setName(const char *name);
   const char *name() const {
@@ -49,7 +54,7 @@ public:
                          esp_matter_attr_val_t *val) override;
 
 private:
-  esp_matter::endpoint_t *createNode(const char *name);
+  esp_matter::endpoint_t *createNode(const char *name, uint16_t endpointId);
 
   char _name[33] = {0};
   bool _started = false;

@@ -2,9 +2,10 @@
 
 #include <stdint.h>
 
-// Accessories are created before the Matter stack starts and can also be added
-// while it is running; both paths go through here.
+// Loads the saved layout and creates the Matter node. Accessories come up in
+// builderResume(), which must run after the stack has started.
 void builderBegin();
+void builderResume();
 
 void builderDraw();
 void builderTouch(int16_t x, int16_t y);
@@ -17,6 +18,15 @@ const char *builderLabel(uint8_t slot);
 
 // Appends an accessory and brings it up immediately. False when full.
 bool builderAdd(bool isButton);
+
+// -1 pages left, +1 pages right. Ignored unless the tile grid is on screen.
+void builderSwipe(int8_t direction);
+
+// Destroys the accessory's endpoint and empties its slot. Slots are not
+// renumbered, so indices stay valid for everything already holding one.
+void builderRemove(uint8_t slot);
+
+bool builderSlotUsed(uint8_t slot);
 
 // Clears the saved layout and reboots into the defaults.
 void builderReset();

@@ -8,6 +8,10 @@
 
 static const uint8_t MAX_SLOTS = 12;
 
+// The aggregator takes the first endpoint after the root node, so accessories
+// start one past it.
+static const uint16_t FIRST_ACCESSORY_ENDPOINT_ID = 2;
+
 // Renaming without a keyboard: tap the title to cycle through these. The
 // chosen name becomes the accessory's NodeLabel, so it reaches Apple Home too.
 static const char *PRESETS[] = {"Lights", "Lamp",    "Music",  "Volume", "Scene",
@@ -16,8 +20,25 @@ static const char *PRESETS[] = {"Lights", "Lamp",    "Music",  "Volume", "Scene"
                                 "Desk",   "Kitchen", "Living", "Office", "Garden"};
 static const uint8_t PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
-// Persisted verbatim as one NVS blob, so the layout must stay stable.
+// A removed accessory leaves its slot empty rather than shifting the ones after
+// it down. Each live endpoint holds a pointer to its BridgedAccessory as
+// priv_data, and its NodeLabel points into that object's name buffer, so
+// nothing in the array may move while the stack is running.
+static const uint8_t PRESET_FREE = 0xFF;
+
+// Persisted verbatim as one NVS blob, so the layout must stay stable. It is
+// held under its own key rather than versioned in-band: the old two-byte layout
+// and this one share divisors, so a length alone cannot tell them apart.
+static const char *SLOTS_KEY = "slots2";
+static const char *LEGACY_SLOTS_KEY = "slots";
+
 struct Slot {
+  uint8_t isButton;
+  uint8_t preset;
+  uint16_t endpointId;
+};
+
+struct LegacySlot {
   uint8_t isButton;
   uint8_t preset;
 };
@@ -30,6 +51,7 @@ static Preferences s_prefs;
 static bool s_dirty = true;
 static int8_t s_openSlot = -1;
 static bool s_addOpen = false;
+static bool s_confirmRemove = false;
 static uint8_t s_page = 0;
 static uint8_t s_activeLevel = 0;
 
@@ -56,12 +78,32 @@ uint8_t builderMaxSlots() {
   return MAX_SLOTS;
 }
 
+bool builderSlotUsed(uint8_t slot) {
+  return slot < s_count && s_slot[slot].preset != PRESET_FREE;
+}
+
 bool builderIsButton(uint8_t slot) {
-  return slot < s_count && s_slot[slot].isButton;
+  return builderSlotUsed(slot) && s_slot[slot].isButton;
 }
 
 const char *builderLabel(uint8_t slot) {
-  return slot < s_count ? PRESETS[s_slot[slot].preset % PRESET_COUNT] : "";
+  return builderSlotUsed(slot) ? PRESETS[s_slot[slot].preset % PRESET_COUNT] : "";
+}
+
+// Tiles show only the slots still in use, so a tile index is not a slot index.
+static uint8_t usedSlots(uint8_t *out) {
+  uint8_t n = 0;
+  for (uint8_t slot = 0; slot < s_count; slot++) {
+    if (builderSlotUsed(slot)) {
+      out[n++] = slot;
+    }
+  }
+  return n;
+}
+
+static uint8_t usedCount() {
+  uint8_t used[MAX_SLOTS];
+  return usedSlots(used);
 }
 
 static uint16_t accentFor(uint8_t slot) {
@@ -69,7 +111,7 @@ static uint16_t accentFor(uint8_t slot) {
 }
 
 static void persistSlots() {
-  s_prefs.putBytes("slots", s_slot, (size_t)s_count * sizeof(Slot));
+  s_prefs.putBytes(SLOTS_KEY, s_slot, (size_t)s_count * sizeof(Slot));
 }
 
 void builderPress(uint8_t slot) {
@@ -81,11 +123,11 @@ void builderPress(uint8_t slot) {
 }
 
 uint8_t builderLevel(uint8_t slot) {
-  return slot < s_count && !builderIsButton(slot) ? s_accessory[slot].getBrightness() : 0;
+  return builderSlotUsed(slot) && !builderIsButton(slot) ? s_accessory[slot].getBrightness() : 0;
 }
 
 void builderSetLevel(uint8_t slot, uint8_t value) {
-  if (slot >= s_count || builderIsButton(slot)) {
+  if (!builderSlotUsed(slot) || builderIsButton(slot)) {
     return;
   }
   s_accessory[slot].setBrightness(value);
@@ -94,7 +136,7 @@ void builderSetLevel(uint8_t slot, uint8_t value) {
 }
 
 void builderSetOnOff(uint8_t slot, bool on) {
-  if (slot >= s_count || builderIsButton(slot)) {
+  if (!builderSlotUsed(slot) || builderIsButton(slot)) {
     return;
   }
   s_accessory[slot].setOnOff(on);
@@ -103,7 +145,7 @@ void builderSetOnOff(uint8_t slot, bool on) {
 }
 
 bool builderOnOff(uint8_t slot) {
-  return slot < s_count && !builderIsButton(slot) && s_accessory[slot].getOnOff();
+  return builderSlotUsed(slot) && !builderIsButton(slot) && s_accessory[slot].getOnOff();
 }
 
 const char *builderActiveLevelLabel() {
@@ -122,7 +164,7 @@ static uint8_t levelOf(uint8_t percent) {
 }
 
 static void nudgeSlot(uint8_t slot, int8_t direction) {
-  if (slot >= s_count || builderIsButton(slot)) {
+  if (!builderSlotUsed(slot) || builderIsButton(slot)) {
     return;
   }
   int16_t percent = (int16_t)percentOf(builderLevel(slot)) + direction * 10;
@@ -135,12 +177,23 @@ void builderNudgeLevel(int8_t direction) {
 
 static void startAccessory(uint8_t slot) {
   const char *name = builderLabel(slot);
-  if (s_slot[slot].isButton) {
-    s_accessory[slot].beginSwitch(name);
+  uint16_t wanted = s_slot[slot].endpointId;
+
+  bool ok = s_slot[slot].isButton ? s_accessory[slot].beginSwitch(name, wanted)
+                                  : s_accessory[slot].beginLight(name, true, 128, wanted);
+  if (!ok) {
     return;
   }
 
-  s_accessory[slot].beginLight(name, true, 128);
+  uint16_t assigned = (uint16_t)s_accessory[slot].getEndPointId();
+  if (assigned != wanted) {
+    s_slot[slot].endpointId = assigned;
+    persistSlots();
+  }
+  if (s_slot[slot].isButton) {
+    return;
+  }
+
   s_accessory[slot].onChangeOnOff([slot](bool on) {
     Serial.printf("HK slot=%u onoff=%d\n", slot, on ? 1 : 0);
     s_dirty = true;
@@ -153,26 +206,66 @@ static void startAccessory(uint8_t slot) {
 }
 
 static void seedDefaults() {
-  static const Slot DEFAULTS[] = {{1, 0}, {1, 2}, {1, 4}, {1, 5}, {0, 3}, {0, 6}};
+  static const Slot DEFAULTS[] = {{1, 0, 0}, {1, 2, 0}, {1, 4, 0},
+                                  {1, 5, 0}, {0, 3, 0}, {0, 6, 0}};
   s_count = sizeof(DEFAULTS) / sizeof(DEFAULTS[0]);
   memcpy(s_slot, DEFAULTS, sizeof(DEFAULTS));
   persistSlots();
 }
 
-void builderBegin() {
-  s_prefs.begin("builder", false);
+static bool loadSlots() {
+  size_t stored = s_prefs.getBytesLength(SLOTS_KEY);
+  if (stored < sizeof(Slot) || stored > sizeof(s_slot) || stored % sizeof(Slot) != 0) {
+    return false;
+  }
+  s_prefs.getBytes(SLOTS_KEY, s_slot, stored);
+  s_count = (uint8_t)(stored / sizeof(Slot));
+  return true;
+}
 
-  size_t stored = s_prefs.getBytesLength("slots");
-  if (stored >= sizeof(Slot) && stored <= sizeof(s_slot) && stored % sizeof(Slot) == 0) {
-    s_prefs.getBytes("slots", s_slot, stored);
-    s_count = (uint8_t)(stored / sizeof(Slot));
-  } else {
-    seedDefaults();
+// Accessories saved before endpoint ids were persisted were created in list
+// order straight after the aggregator, so that is the id each one still holds
+// in every controller that has already seen it.
+static bool migrateLegacySlots() {
+  size_t stored = s_prefs.getBytesLength(LEGACY_SLOTS_KEY);
+  if (stored < sizeof(LegacySlot) || stored % sizeof(LegacySlot) != 0) {
+    return false;
+  }
+  uint8_t count = (uint8_t)(stored / sizeof(LegacySlot));
+  if (count > MAX_SLOTS) {
+    return false;
   }
 
+  LegacySlot legacy[MAX_SLOTS];
+  s_prefs.getBytes(LEGACY_SLOTS_KEY, legacy, stored);
+  s_count = count;
+  for (uint8_t slot = 0; slot < count; slot++) {
+    s_slot[slot].isButton = legacy[slot].isButton;
+    s_slot[slot].preset = legacy[slot].preset;
+    s_slot[slot].endpointId = (uint16_t)(FIRST_ACCESSORY_ENDPOINT_ID + slot);
+  }
+  persistSlots();
+  s_prefs.remove(LEGACY_SLOTS_KEY);
+  Serial.printf("SLOTS migrated %u accessories to persisted endpoint ids\n", count);
+  return true;
+}
+
+void builderBegin() {
+  s_prefs.begin("builder", false);
+  if (!loadSlots() && !migrateLegacySlots()) {
+    seedDefaults();
+  }
   bridgeBegin();
+}
+
+// Deliberately after esp_matter::start(): reclaiming an endpoint id needs the
+// stack's counter restored from NVS first, so accessories cannot come up with
+// the node.
+void builderResume() {
   for (uint8_t slot = 0; slot < s_count; slot++) {
-    startAccessory(slot);
+    if (builderSlotUsed(slot)) {
+      startAccessory(slot);
+    }
   }
 }
 
@@ -182,7 +275,7 @@ static uint8_t unusedPreset() {
   for (uint8_t preset = 0; preset < PRESET_COUNT; preset++) {
     bool taken = false;
     for (uint8_t slot = 0; slot < s_count && !taken; slot++) {
-      taken = s_slot[slot].preset == preset;
+      taken = builderSlotUsed(slot) && s_slot[slot].preset == preset;
     }
     if (!taken) {
       return preset;
@@ -191,30 +284,86 @@ static uint8_t unusedPreset() {
   return 0;
 }
 
-// Restarting rather than bringing the accessory up live is deliberate. An
-// endpoint created while the stack is running takes the next free id, which is
-// not the id the same accessory gets from a cold boot's creation order, so it
-// would change identity on the next restart and controllers would re-add it.
-// Recreating everything in order keeps ids stable for good.
+static int8_t claimSlot() {
+  for (uint8_t slot = 0; slot < s_count; slot++) {
+    if (!builderSlotUsed(slot)) {
+      return (int8_t)slot;
+    }
+  }
+  return s_count < MAX_SLOTS ? (int8_t)s_count : -1;
+}
+
 bool builderAdd(bool isButton) {
-  if (s_count >= MAX_SLOTS) {
+  int8_t claimed = claimSlot();
+  if (claimed < 0) {
     Serial.println("ADD full");
     return false;
   }
-  uint8_t slot = s_count;
+  uint8_t slot = (uint8_t)claimed;
+  if (slot == s_count) {
+    s_count++;
+  }
   s_slot[slot].isButton = isButton ? 1 : 0;
   s_slot[slot].preset = unusedPreset();
-  s_count++;
+  s_slot[slot].endpointId = 0;
   persistSlots();
-  Serial.printf("ADD %u %s %s, restarting\n", slot, isButton ? "button" : "level",
-                builderLabel(slot));
-  delay(200);
-  ESP.restart();
+  startAccessory(slot);
+
+  s_addOpen = false;
+  s_page = (uint8_t)((usedCount() - 1) / PER_PAGE);
+  s_dirty = true;
+  Serial.printf("ADD %u %s %s\n", slot, isButton ? "button" : "level", builderLabel(slot));
   return true;
 }
 
+static uint8_t tileCount() {
+  uint8_t used = usedCount();
+  return used < MAX_SLOTS ? (uint8_t)(used + 1) : used;
+}
+
+static uint8_t pageCount() {
+  return (uint8_t)((tileCount() + PER_PAGE - 1) / PER_PAGE);
+}
+
+// The slot is emptied rather than reclaimed: startAccessory() would otherwise
+// hand a stale endpoint id to a different accessory.
+void builderRemove(uint8_t slot) {
+  if (!builderSlotUsed(slot)) {
+    return;
+  }
+  if (!s_accessory[slot].remove()) {
+    Serial.printf("REMOVE %u failed\n", slot);
+    return;
+  }
+  Serial.printf("REMOVE %u %s\n", slot, builderLabel(slot));
+
+  s_slot[slot].preset = PRESET_FREE;
+  s_slot[slot].endpointId = 0;
+  while (s_count > 0 && !builderSlotUsed((uint8_t)(s_count - 1))) {
+    s_count--;
+  }
+  persistSlots();
+
+  if (s_activeLevel == slot) {
+    s_activeLevel = 0;
+    for (uint8_t i = 0; i < s_count; i++) {
+      if (builderSlotUsed(i) && !builderIsButton(i)) {
+        s_activeLevel = i;
+        break;
+      }
+    }
+  }
+  s_openSlot = -1;
+  s_confirmRemove = false;
+  if (s_page >= pageCount()) {
+    s_page = (uint8_t)(pageCount() - 1);
+  }
+  s_dirty = true;
+}
+
 void builderReset() {
-  s_prefs.remove("slots");
+  s_prefs.remove(SLOTS_KEY);
+  s_prefs.remove(LEGACY_SLOTS_KEY);
   Serial.println("RESET slots cleared, restarting");
   delay(200);
   ESP.restart();
@@ -224,14 +373,6 @@ bool builderNeedsRedraw() {
   bool was = s_dirty;
   s_dirty = false;
   return was;
-}
-
-static uint8_t tileCount() {
-  return s_count < MAX_SLOTS ? (uint8_t)(s_count + 1) : s_count;
-}
-
-static uint8_t pageCount() {
-  return (uint8_t)((tileCount() + PER_PAGE - 1) / PER_PAGE);
 }
 
 static void tileRect(uint8_t index, int16_t *x, int16_t *y) {
@@ -252,6 +393,20 @@ static void drawCentred(int16_t y, const char *text, uint8_t size, uint16_t colo
   drawText((PANEL_W - (int16_t)strlen(text) * 6 * size) / 2, y, text, size, colour);
 }
 
+static void drawPageDots() {
+  uint8_t pages = pageCount();
+  if (pages < 2) {
+    return;
+  }
+  Arduino_Canvas &g = panelCanvas();
+  const int16_t spacing = 18;
+  int16_t x = (PANEL_W - (pages - 1) * spacing) / 2;
+  for (uint8_t page = 0; page < pages; page++) {
+    g.fillCircle(x + page * spacing, PANEL_H - 44, 4,
+                 page == s_page ? RGB565_WHITE : RGB565(70, 70, 80));
+  }
+}
+
 static void drawList() {
   Arduino_Canvas &g = panelCanvas();
   g.fillScreen(RGB565_BLACK);
@@ -259,38 +414,35 @@ static void drawList() {
   g.fillCircle(PANEL_W - 24, 30, 7,
                Matter.isDeviceCommissioned() ? RGB565(90, 220, 130) : RGB565(230, 90, 90));
 
-  if (pageCount() > 1) {
-    char page[8];
-    snprintf(page, sizeof(page), "%u/%u", s_page + 1, pageCount());
-    drawText(240, 24, "<", 2, COL_MUTED);
-    drawText(264, 26, page, 1, COL_MUTED);
-    drawText(304, 24, ">", 2, COL_MUTED);
-  }
-
+  uint8_t used[MAX_SLOTS];
+  uint8_t count = usedSlots(used);
   uint8_t first = s_page * PER_PAGE;
   for (uint8_t i = first; i < tileCount() && i < first + PER_PAGE; i++) {
     int16_t x, y;
     tileRect(i, &x, &y);
 
-    if (i >= s_count) {
+    if (i >= count) {
       g.drawRoundRect(x, y, TILE_W, TILE_H, 12, RGB565(70, 70, 80));
       drawText(x + TILE_W / 2 - 12, y + 34, "+", 4, COL_MUTED);
       continue;
     }
 
+    uint8_t slot = used[i];
     g.fillRoundRect(x, y, TILE_W, TILE_H, 12, COL_BG);
-    g.drawRoundRect(x, y, TILE_W, TILE_H, 12, accentFor(i));
-    drawText(x + 12, y + 18, builderLabel(i), 2, RGB565_WHITE);
+    g.drawRoundRect(x, y, TILE_W, TILE_H, 12, accentFor(slot));
+    drawText(x + 12, y + 18, builderLabel(slot), 2, RGB565_WHITE);
 
     char detail[24];
-    if (builderIsButton(i)) {
+    if (builderIsButton(slot)) {
       snprintf(detail, sizeof(detail), "button");
     } else {
-      snprintf(detail, sizeof(detail), "level  %u%%  %s", percentOf(builderLevel(i)),
-               builderOnOff(i) ? "on" : "off");
+      snprintf(detail, sizeof(detail), "level  %u%%  %s", percentOf(builderLevel(slot)),
+               builderOnOff(slot) ? "on" : "off");
     }
     drawText(x + 12, y + 62, detail, 1, COL_MUTED);
   }
+
+  drawPageDots();
 
   char hint[40];
   snprintf(hint, sizeof(hint), "BOOT +/- PWR  %s", builderActiveLevelLabel());
@@ -313,6 +465,8 @@ static void drawDetail(uint8_t slot) {
   Arduino_Canvas &g = panelCanvas();
   g.fillScreen(RGB565_BLACK);
   drawText(16, 24, "< back", 2, COL_MUTED);
+  drawText(PANEL_W - 100, 26, s_confirmRemove ? "tap to confirm" : "remove", 1,
+           s_confirmRemove ? RGB565(240, 90, 90) : COL_FAINT);
   drawCentred(72, builderLabel(slot), 3, RGB565_WHITE);
   drawCentred(104, "tap name to rename", 1, COL_FAINT);
 
@@ -363,18 +517,18 @@ static void cycleName(uint8_t slot) {
   Serial.printf("NAME %u %s\n", slot, builderLabel(slot));
 }
 
-static void touchList(int16_t x, int16_t y) {
-  if (pageCount() > 1 && inRect(x, y, 230, 4, 50, 52)) {
-    s_page = (uint8_t)((s_page + pageCount() - 1) % pageCount());
-    s_dirty = true;
+void builderSwipe(int8_t direction) {
+  uint8_t pages = pageCount();
+  if (s_addOpen || s_openSlot >= 0 || pages < 2) {
     return;
   }
-  if (pageCount() > 1 && inRect(x, y, 294, 4, 50, 52)) {
-    s_page = (uint8_t)((s_page + 1) % pageCount());
-    s_dirty = true;
-    return;
-  }
+  s_page = (uint8_t)((s_page + pages + direction) % pages);
+  s_dirty = true;
+}
 
+static void touchList(int16_t x, int16_t y) {
+  uint8_t used[MAX_SLOTS];
+  uint8_t count = usedSlots(used);
   uint8_t first = s_page * PER_PAGE;
   for (uint8_t i = first; i < tileCount() && i < first + PER_PAGE; i++) {
     int16_t tx, ty;
@@ -382,12 +536,12 @@ static void touchList(int16_t x, int16_t y) {
     if (!inRect(x, y, tx, ty, TILE_W, TILE_H)) {
       continue;
     }
-    if (i >= s_count) {
+    if (i >= count) {
       s_addOpen = true;
     } else {
-      s_openSlot = (int8_t)i;
-      if (!builderIsButton(i)) {
-        s_activeLevel = i;
+      s_openSlot = (int8_t)used[i];
+      if (!builderIsButton(used[i])) {
+        s_activeLevel = used[i];
       }
     }
     s_dirty = true;
@@ -406,17 +560,26 @@ static void touchAdd(int16_t x, int16_t y) {
   if (!isButton && !inRect(x, y, 44, 270, 280, 110)) {
     return;
   }
-
-  // builderAdd restarts the device, so say so before the screen goes dark.
-  Arduino_Canvas &g = panelCanvas();
-  g.fillScreen(RGB565_BLACK);
-  drawCentred(200, "Adding accessory", 2, RGB565_WHITE);
-  drawCentred(236, "restarting", 1, COL_MUTED);
-  panelFlush();
   builderAdd(isButton);
 }
 
 static void touchDetail(uint8_t slot, int16_t x, int16_t y) {
+  bool confirming = s_confirmRemove;
+  s_confirmRemove = false;
+
+  if (inRect(x, y, PANEL_W - 112, 4, 112, 52)) {
+    if (confirming) {
+      builderRemove(slot);
+    } else {
+      s_confirmRemove = true;
+      s_dirty = true;
+    }
+    return;
+  }
+  if (confirming) {
+    s_dirty = true;
+  }
+
   if (inRect(x, y, 0, 0, 130, 56)) {
     s_openSlot = -1;
     s_dirty = true;

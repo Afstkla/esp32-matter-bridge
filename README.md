@@ -54,20 +54,31 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
 
 ## Using it
 
-- **Tile grid** — one tile per accessory, paged if there are more than six.
-- **`+` tile** — add a button or a level. The device restarts (see below).
+- **Tile grid** — one tile per accessory, six to a page. **Swipe left or right**
+  to change page; the dots at the bottom show where you are.
+- **`+` tile** — add a button or a level. It appears in Home within a second or
+  two; no restart.
 - **Tap an accessory** — press it, toggle it, or nudge its level ±10%.
 - **Tap the name** — cycles through a list of preset names. The chosen name is
   pushed to the accessory's `NodeLabel`, so it reaches Home too.
+- **remove** — top right of an accessory's screen, then tap again to confirm.
 - The screen sleeps after a minute and wakes on touch.
 
-Adding an accessory restarts the device on purpose. An endpoint created while
-the stack is running takes the next free endpoint ID, which is *not* the ID the
-same accessory would get from a cold boot's creation order — so it would change
-identity on the next restart and controllers would re-add it as a new
-accessory. Recreating everything in boot order keeps IDs stable for good.
-(`bridged_node::resume()` looks like the fix but validates against esp_matter's
-allocation counter and cannot claim an ID the current session has not reached.)
+Taps register on release, which is what makes a swipe distinguishable from a
+tap. A press that drifts more than ~24 px is treated as neither.
+
+Accessories are built *after* `esp_matter::start()`, not before it, and each one
+remembers the endpoint ID it was given. That ordering is the whole trick: the
+stack restores its endpoint-ID counter from NVS as it starts, and
+`bridged_node::resume()` will only reclaim an ID below that counter — so before
+`start()` it can never succeed, and after it always can. Adding an accessory is
+then just another `create()`, and it keeps its identity across reboots without
+anything restarting. See [docs/matter-notes.md](docs/matter-notes.md).
+
+Removing one destroys its endpoint and leaves the slot empty rather than
+shifting the others down — every live endpoint holds a pointer into its
+accessory object, so nothing may move while the stack is running. The next
+accessory added fills the gap.
 
 ## Serial console
 
@@ -83,7 +94,8 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | --- | --- |
 | `diag` | commissioning state, WiFi, IPv6, fabric count |
 | `slots` | list accessories |
-| `add button` / `add level` | append an accessory (restarts) |
+| `add button` / `add level` | add an accessory |
+| `remove N` | delete an accessory |
 | `reset slots` | back to the default six (restarts) |
 | `click N` | fire a switch press |
 | `on N 0\|1`, `level N 0-255` | drive a level accessory |

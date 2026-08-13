@@ -29,6 +29,14 @@ bool netcfgJoin(uint32_t timeoutMs) {
   WiFi.enableIPv6(true);
   WiFi.begin(ssid.c_str(), prefs().getString("pass", "").c_str());
 
+  // Waiting here holds up the whole boot, and nothing downstream needs the link
+  // to be up: the Matter stack drives its own reconnection and republishes mDNS
+  // when the interface arrives. The screen reports the state as it changes.
+  if (timeoutMs == 0) {
+    Serial.printf("WIFI joining '%s' in the background\n", ssid.c_str());
+    return false;
+  }
+
   uint32_t until = millis() + timeoutMs;
   while (millis() < until && WiFi.status() != WL_CONNECTED) {
     delay(200);
