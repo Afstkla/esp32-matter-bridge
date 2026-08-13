@@ -1,4 +1,6 @@
 #include "panel.h"
+#include "theme.h"
+
 #include <Wire.h>
 
 static const uint8_t PIN_SDA = 15;
@@ -105,7 +107,7 @@ bool panelInit() {
     return false;
   }
   s_panel->setBrightness(0);
-  s_canvas->fillScreen(RGB565_BLACK);
+  s_canvas->fillScreen(COL_BLACK);
   panelFlush();
   s_panel->setBrightness(PANEL_ON_BRIGHTNESS);
   return true;
@@ -133,7 +135,7 @@ void panelSleep() {
   if (s_asleep) {
     return;
   }
-  s_canvas->fillScreen(RGB565_BLACK);
+  s_canvas->fillScreen(COL_BLACK);
   panelFlush();
   s_panel->setBrightness(0);
   s_asleep = true;
@@ -148,10 +150,16 @@ void panelWake() {
   s_asleep = false;
 }
 
-// CO5300 leaves the panel black if a frame arrives as many small writes, so the
-// whole framebuffer goes out in a single transaction.
+// Be, not RGB: the framebuffer already holds big-endian pixels (see theme.h),
+// so this hands the buffer to the SPI DMA whole. draw16bitRGBBitmap() would
+// instead copy it pixel by pixel into a 2 KB bounce buffer, byte-swapping as it
+// goes — 35 ms a frame against 18 ms for the same 322 KB, when the wire itself
+// only needs 8 ms at 80 MHz.
+//
+// It stays one transaction either way: the CO5300 leaves the panel black if a
+// frame arrives as many small writes.
 void panelFlush() {
-  s_panel->draw16bitRGBBitmap(0, 0, s_canvas->getFramebuffer(), PANEL_W, PANEL_H);
+  s_panel->draw16bitBeRGBBitmap(0, 0, s_canvas->getFramebuffer(), PANEL_W, PANEL_H);
 }
 
 // Prints the touch registers whenever they change. The digitiser reports

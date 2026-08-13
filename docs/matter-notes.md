@@ -121,6 +121,29 @@ that era), and esp_matter 1.3.1+ requires `1.2.2`, so nothing above 1.3.0 will
 resolve. 3.2.x bumps Insights and 3.3.x ships esp_matter 1.5. The unit of
 upgrade is the core, not the component.
 
+## The panel cannot scroll itself
+
+Worth knowing before designing any transition: the CO5300 command set runs
+0x30 `PTLAR`, 0x31 `PTLAC`, 0x34 `TEAROFF` — there is no 0x33 `VSCRDEF` or
+0x37 `VSCSAD`. Unlike most ILI/ST controllers it has no scroll register, so it
+cannot shift its own frame memory in any direction. Every pixel that appears at
+a new position has to be written there.
+
+That makes a horizontal slide the worst case: every pixel on screen moves every
+frame, so the delta *is* the whole screen. Pre-rendering both pages into one
+double-width buffer and pushing a moving window does not help either, because a
+window out of a wider buffer is strided — one SPI transaction per row instead of
+one for the frame. Measured on this board:
+
+```
+whole frame, 448 rows, 322 KB, contiguous   18.8 ms
+tile band,   330 rows, 243 KB, row by row   20.3 ms
+```
+
+Three quarters of the data costs more, because the ~43 us per-transaction
+overhead against 330 rows outweighs the 6 ms the smaller payload saves. Fewer,
+larger transfers win; the payload size barely matters.
+
 ## Progress logging does not exist
 
 ```console

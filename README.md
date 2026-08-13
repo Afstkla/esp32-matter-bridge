@@ -54,14 +54,18 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
 
 ## Using it
 
+- **QR screen** — top right corner of the tile grid, and only there. A hotspot
+  that outlives its screen silently eats taps meant for whatever replaced it.
 - **Tile grid** — one tile per accessory, six to a page. **Swipe left or right**
   to change page; the pages slide across (~200 ms) and the dots at the bottom
   show where you are.
-- **`+` tile** — add a button or a level. It appears in Home within a second or
-  two; no restart.
+- **`+` tile** — add a button or a level, then pick its name. It appears in Home
+  within a second or two; no restart.
 - **Tap an accessory** — press it, toggle it, or nudge its level ±10%.
-- **Tap the name** — cycles through a list of preset names. The chosen name is
-  pushed to the accessory's `NodeLabel`, so it reaches Home too.
+- **Tap the name** — opens the same name picker. The chosen name is pushed to
+  the accessory's `NodeLabel`, so it reaches Home too. Names already in use are
+  greyed out: duplicates are legal in Matter but miserable to tell apart in the
+  Home app.
 - **remove** — top right of an accessory's screen, then tap again to confirm.
 - The screen sleeps after a minute and wakes on touch.
 

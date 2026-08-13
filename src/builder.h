@@ -17,7 +17,12 @@ bool builderIsButton(uint8_t slot);
 const char *builderLabel(uint8_t slot);
 
 // Appends an accessory and brings it up immediately. False when full.
-bool builderAdd(bool isButton);
+// BUILDER_PRESET_AUTO takes the first name nothing else is using.
+static const uint8_t BUILDER_PRESET_AUTO = 0xFF;
+bool builderAdd(bool isButton, uint8_t preset = BUILDER_PRESET_AUTO);
+
+// True when the tile grid is showing, rather than a screen layered over it.
+bool builderAtRoot();
 
 // -1 pages left, +1 pages right. Ignored unless the tile grid is on screen.
 void builderSwipe(int8_t direction);

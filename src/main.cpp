@@ -11,6 +11,7 @@
 #include "keys.h"
 #include "netcfg.h"
 #include "panel.h"
+#include "theme.h"
 
 // The prebuilt Arduino lwIP is compiled with CONFIG_LWIP_HOOK_IP6_INPUT_CUSTOM,
 // so the application must supply this hook or the link fails. Dropping packets
@@ -65,7 +66,7 @@ static void drawPairingScreen() {
   qrcode_initText(&qr, buffer, 4, ECC_LOW, pairingPayload().c_str());
 
   Arduino_Canvas &g = panelCanvas();
-  g.fillScreen(RGB565_BLACK);
+  g.fillScreen(COL_BLACK);
 
   const int16_t scale = 8;
   const int16_t quiet = 4 * scale;
@@ -73,27 +74,27 @@ static void drawPairingScreen() {
   const int16_t x0 = (PANEL_W - box) / 2;
   const int16_t y0 = 34;
 
-  g.fillRect(x0, y0, box, box, RGB565_WHITE);
+  g.fillRect(x0, y0, box, box, COL_WHITE);
   for (uint8_t y = 0; y < qr.size; y++) {
     for (uint8_t x = 0; x < qr.size; x++) {
       if (qrcode_getModule(&qr, x, y)) {
-        g.fillRect(x0 + quiet + x * scale, y0 + quiet + y * scale, scale, scale, RGB565_BLACK);
+        g.fillRect(x0 + quiet + x * scale, y0 + quiet + y * scale, scale, scale, COL_BLACK);
       }
     }
   }
 
-  drawCentredText(y0 + box + 22, formattedPairingCode(), 2, RGB565_WHITE);
+  drawCentredText(y0 + box + 22, formattedPairingCode(), 2, COL_WHITE);
 
   bool online = WiFi.status() == WL_CONNECTED;
   const char *hint = !online          ? "No WiFi - pairing cannot work"
                      : Matter.isDeviceCommissioned() ? "Already paired"
                                                      : "Scan in Apple Home";
-  drawCentredText(y0 + box + 52, hint, 1, online ? RGB565(140, 140, 140) : RGB565(255, 90, 90));
+  drawCentredText(y0 + box + 52, hint, 1, online ? COL_DIM : COL_WARN);
   if (online) {
     drawCentredText(y0 + box + 68, WiFi.SSID() + "  " + WiFi.localIP().toString(), 1,
-                    RGB565(90, 130, 90));
+                    COL_NET);
   }
-  drawCentredText(PANEL_H - 20, "tap to continue", 1, RGB565(110, 110, 120));
+  drawCentredText(PANEL_H - 20, "tap to continue", 1, COL_FAINT);
   panelFlush();
 }
 
@@ -320,7 +321,9 @@ static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
   if (s_showQr) {
     s_showQr = false;
     drawScreen();
-  } else if (x0 > PANEL_W - 60 && y0 < 60) {
+  } else if (builderAtRoot() && x0 > PANEL_W - 60 && y0 < 60) {
+    // Only the tile grid gives up its top right corner. Any screen below it
+    // owns that space, and a global hotspot silently eats whatever it lands on.
     s_showQr = true;
     drawScreen();
   } else {

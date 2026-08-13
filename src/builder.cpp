@@ -5,6 +5,7 @@
 
 #include "bridge.h"
 #include "panel.h"
+#include "theme.h"
 
 static const uint8_t MAX_SLOTS = 12;
 
@@ -52,6 +53,9 @@ static bool s_dirty = true;
 static int8_t s_openSlot = -1;
 static bool s_addOpen = false;
 static bool s_confirmRemove = false;
+static bool s_pickOpen = false;
+static int8_t s_pickSlot = -1;  // -1 while choosing the name for a new accessory
+static bool s_pickIsButton = false;
 static uint8_t s_page = 0;
 static uint8_t s_activeLevel = 0;
 
@@ -63,12 +67,8 @@ static const int16_t TILE_X0 = 12;
 static const int16_t TILE_Y0 = 62;
 static const int16_t TILE_GAP = 10;
 static const uint8_t PER_PAGE = 6;
-
-static const uint16_t COL_BG = RGB565(28, 28, 32);
-static const uint16_t COL_MUTED = RGB565(150, 150, 160);
-static const uint16_t COL_FAINT = RGB565(110, 110, 120);
-static const uint16_t COL_BUTTON = RGB565(70, 140, 240);
-static const uint16_t COL_LEVEL = RGB565(240, 160, 60);
+static const int16_t PICK_Y0 = 62;
+static const int16_t PICK_ROW_H = 34;
 
 uint8_t builderSlotCount() {
   return s_count;
@@ -293,7 +293,7 @@ static int8_t claimSlot() {
   return s_count < MAX_SLOTS ? (int8_t)s_count : -1;
 }
 
-bool builderAdd(bool isButton) {
+bool builderAdd(bool isButton, uint8_t preset) {
   int8_t claimed = claimSlot();
   if (claimed < 0) {
     Serial.println("ADD full");
@@ -304,7 +304,7 @@ bool builderAdd(bool isButton) {
     s_count++;
   }
   s_slot[slot].isButton = isButton ? 1 : 0;
-  s_slot[slot].preset = unusedPreset();
+  s_slot[slot].preset = preset == BUILDER_PRESET_AUTO ? unusedPreset() : preset;
   s_slot[slot].endpointId = 0;
   persistSlots();
   startAccessory(slot);
@@ -369,6 +369,10 @@ void builderReset() {
   ESP.restart();
 }
 
+bool builderAtRoot() {
+  return !s_addOpen && !s_pickOpen && s_openSlot < 0;
+}
+
 bool builderNeedsRedraw() {
   bool was = s_dirty;
   s_dirty = false;
@@ -403,7 +407,7 @@ static void drawPageDots(uint8_t current) {
   int16_t x = (PANEL_W - (pages - 1) * spacing) / 2;
   for (uint8_t page = 0; page < pages; page++) {
     g.fillCircle(x + page * spacing, PANEL_H - 44, 4,
-                 page == current ? RGB565_WHITE : RGB565(70, 70, 80));
+                 page == current ? COL_WHITE : COL_OUTLINE);
   }
 }
 
@@ -411,9 +415,9 @@ static void drawPageDots(uint8_t current) {
 // slide is both cheaper and closer to how a paged home screen behaves.
 static void drawChrome(uint8_t current) {
   Arduino_Canvas &g = panelCanvas();
-  drawText(14, 24, "Accessories", 2, RGB565_WHITE);
+  drawText(14, 24, "Accessories", 2, COL_WHITE);
   g.fillCircle(PANEL_W - 24, 30, 7,
-               Matter.isDeviceCommissioned() ? RGB565(90, 220, 130) : RGB565(230, 90, 90));
+               Matter.isDeviceCommissioned() ? COL_OK : COL_ALERT);
   drawPageDots(current);
 
   char hint[40];
@@ -435,7 +439,7 @@ static void drawTiles(uint8_t page, int16_t dx) {
     }
 
     if (i >= count) {
-      g.drawRoundRect(x, y, TILE_W, TILE_H, 12, RGB565(70, 70, 80));
+      g.drawRoundRect(x, y, TILE_W, TILE_H, 12, COL_OUTLINE);
       drawText(x + TILE_W / 2 - 12, y + 34, "+", 4, COL_MUTED);
       continue;
     }
@@ -443,7 +447,7 @@ static void drawTiles(uint8_t page, int16_t dx) {
     uint8_t slot = used[i];
     g.fillRoundRect(x, y, TILE_W, TILE_H, 12, COL_BG);
     g.drawRoundRect(x, y, TILE_W, TILE_H, 12, accentFor(slot));
-    drawText(x + 12, y + 18, builderLabel(slot), 2, RGB565_WHITE);
+    drawText(x + 12, y + 18, builderLabel(slot), 2, COL_WHITE);
 
     char detail[24];
     if (builderIsButton(slot)) {
@@ -457,59 +461,97 @@ static void drawTiles(uint8_t page, int16_t dx) {
 }
 
 static void drawList() {
-  panelCanvas().fillScreen(RGB565_BLACK);
+  panelCanvas().fillScreen(COL_BLACK);
   drawChrome(s_page);
   drawTiles(s_page, 0);
 }
 
+// Two accessories sharing a name is legal but miserable to tell apart in the
+// Home app, so a name already spoken for is shown but cannot be picked.
+static bool presetTaken(uint8_t preset, int8_t exceptSlot) {
+  for (uint8_t slot = 0; slot < s_count; slot++) {
+    if ((int8_t)slot == exceptSlot || !builderSlotUsed(slot)) {
+      continue;
+    }
+    if (s_slot[slot].preset == preset) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void pickCell(uint8_t index, int16_t *x, int16_t *y) {
+  *x = TILE_X0 + (index % 2) * (TILE_W + TILE_GAP);
+  *y = PICK_Y0 + (index / 2) * PICK_ROW_H;
+}
+
+static void drawPicker() {
+  Arduino_Canvas &g = panelCanvas();
+  g.fillScreen(COL_BLACK);
+  drawText(16, 24, "< back", 2, COL_MUTED);
+
+  for (uint8_t preset = 0; preset < PRESET_COUNT; preset++) {
+    int16_t x, y;
+    pickCell(preset, &x, &y);
+    bool mine = s_pickSlot >= 0 && s_slot[s_pickSlot].preset == preset;
+    if (mine) {
+      g.fillRoundRect(x, y, TILE_W, PICK_ROW_H - 4, 8, COL_BG);
+    }
+    drawText(x + 12, y + 8, PRESETS[preset], 2,
+             presetTaken(preset, s_pickSlot) ? COL_OUTLINE : COL_WHITE);
+  }
+}
+
 static void drawAdd() {
   Arduino_Canvas &g = panelCanvas();
-  g.fillScreen(RGB565_BLACK);
+  g.fillScreen(COL_BLACK);
   drawText(16, 24, "< back", 2, COL_MUTED);
-  drawCentred(80, "New accessory", 2, RGB565_WHITE);
+  drawCentred(80, "New accessory", 2, COL_WHITE);
 
   g.fillRoundRect(44, 140, 280, 110, 20, COL_BUTTON);
-  drawCentred(184, "BUTTON", 3, RGB565_BLACK);
+  drawCentred(184, "BUTTON", 3, COL_BLACK);
   g.fillRoundRect(44, 270, 280, 110, 20, COL_LEVEL);
-  drawCentred(314, "LEVEL", 3, RGB565_BLACK);
+  drawCentred(314, "LEVEL", 3, COL_BLACK);
 }
 
 static void drawDetail(uint8_t slot) {
   Arduino_Canvas &g = panelCanvas();
-  g.fillScreen(RGB565_BLACK);
+  g.fillScreen(COL_BLACK);
   drawText(16, 24, "< back", 2, COL_MUTED);
   drawText(PANEL_W - 100, 26, s_confirmRemove ? "tap to confirm" : "remove", 1,
-           s_confirmRemove ? RGB565(240, 90, 90) : COL_FAINT);
-  drawCentred(72, builderLabel(slot), 3, RGB565_WHITE);
+           s_confirmRemove ? COL_DANGER : COL_FAINT);
+  drawCentred(72, builderLabel(slot), 3, COL_WHITE);
   drawCentred(104, "tap name to rename", 1, COL_FAINT);
 
   if (builderIsButton(slot)) {
     g.fillRoundRect(44, 150, 280, 190, 24, accentFor(slot));
-    drawCentred(232, "PRESS", 3, RGB565_BLACK);
+    drawCentred(232, "PRESS", 3, COL_BLACK);
     return;
   }
 
   uint8_t level = builderLevel(slot);
-  g.fillRoundRect(30, 180, 90, 120, 16, RGB565(40, 40, 46));
-  drawText(66, 228, "-", 4, RGB565_WHITE);
-  g.fillRoundRect(248, 180, 90, 120, 16, RGB565(40, 40, 46));
-  drawText(284, 228, "+", 4, RGB565_WHITE);
+  g.fillRoundRect(30, 180, 90, 120, 16, COL_WELL);
+  drawText(66, 228, "-", 4, COL_WHITE);
+  g.fillRoundRect(248, 180, 90, 120, 16, COL_WELL);
+  drawText(284, 228, "+", 4, COL_WHITE);
 
-  g.drawRoundRect(134, 180, 100, 120, 12, RGB565(70, 70, 80));
+  g.drawRoundRect(134, 180, 100, 120, 12, COL_OUTLINE);
   int16_t fill = (int16_t)((uint32_t)level * 116 / 255);
   g.fillRoundRect(136, 180 + 2 + (116 - fill), 96, fill, 10, accentFor(slot));
 
   char buf[8];
   snprintf(buf, sizeof(buf), "%u%%", percentOf(level));
-  drawCentred(322, buf, 2, RGB565_WHITE);
+  drawCentred(322, buf, 2, COL_WHITE);
 
   bool on = builderOnOff(slot);
-  g.fillRoundRect(60, 356, 248, 56, 16, on ? accentFor(slot) : RGB565(40, 40, 46));
-  drawCentred(376, on ? "ON" : "OFF", 3, on ? RGB565_BLACK : COL_MUTED);
+  g.fillRoundRect(60, 356, 248, 56, 16, on ? accentFor(slot) : COL_WELL);
+  drawCentred(376, on ? "ON" : "OFF", 3, on ? COL_BLACK : COL_MUTED);
 }
 
 void builderDraw() {
-  if (s_addOpen) {
+  if (s_pickOpen) {
+    drawPicker();
+  } else if (s_addOpen) {
     drawAdd();
   } else if (s_openSlot < 0) {
     drawList();
@@ -523,13 +565,6 @@ static bool inRect(int16_t x, int16_t y, int16_t rx, int16_t ry, int16_t rw, int
   return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
-static void cycleName(uint8_t slot) {
-  s_slot[slot].preset = (uint8_t)((s_slot[slot].preset + 1) % PRESET_COUNT);
-  persistSlots();
-  s_accessory[slot].setName(builderLabel(slot));
-  Serial.printf("NAME %u %s\n", slot, builderLabel(slot));
-}
-
 // Eased travel, as a percentage of the screen width. The last step is the
 // normal redraw the caller triggers, so the list stops at 100 without paying
 // for a frame that draws two pages.
@@ -537,7 +572,7 @@ static const uint8_t SLIDE_STEPS[] = {34, 60, 79, 92};
 
 void builderSwipe(int8_t direction) {
   uint8_t pages = pageCount();
-  if (s_addOpen || s_openSlot >= 0 || pages < 2) {
+  if (!builderAtRoot() || pages < 2) {
     return;
   }
   uint8_t from = s_page;
@@ -546,7 +581,7 @@ void builderSwipe(int8_t direction) {
   for (uint8_t step = 0; step < sizeof(SLIDE_STEPS) / sizeof(SLIDE_STEPS[0]); step++) {
     int16_t travelled = (int16_t)((int32_t)PANEL_W * SLIDE_STEPS[step] / 100);
     int16_t offset = direction > 0 ? -travelled : travelled;
-    panelCanvas().fillScreen(RGB565_BLACK);
+    panelCanvas().fillScreen(COL_BLACK);
     drawChrome(to);
     drawTiles(from, offset);
     drawTiles(to, direction > 0 ? offset + PANEL_W : offset - PANEL_W);
@@ -580,6 +615,37 @@ static void touchList(int16_t x, int16_t y) {
   }
 }
 
+static void touchPicker(int16_t x, int16_t y) {
+  if (inRect(x, y, 0, 0, 130, 56)) {
+    s_pickOpen = false;
+    s_addOpen = s_pickSlot < 0;
+    s_dirty = true;
+    return;
+  }
+
+  for (uint8_t preset = 0; preset < PRESET_COUNT; preset++) {
+    int16_t cx, cy;
+    pickCell(preset, &cx, &cy);
+    if (!inRect(x, y, cx, cy, TILE_W, PICK_ROW_H)) {
+      continue;
+    }
+    if (presetTaken(preset, s_pickSlot)) {
+      return;
+    }
+    s_pickOpen = false;
+    if (s_pickSlot < 0) {
+      builderAdd(s_pickIsButton, preset);
+      return;
+    }
+    s_slot[s_pickSlot].preset = preset;
+    persistSlots();
+    s_accessory[s_pickSlot].setName(builderLabel((uint8_t)s_pickSlot));
+    Serial.printf("NAME %d %s\n", s_pickSlot, builderLabel((uint8_t)s_pickSlot));
+    s_dirty = true;
+    return;
+  }
+}
+
 static void touchAdd(int16_t x, int16_t y) {
   if (inRect(x, y, 0, 0, 130, 56)) {
     s_addOpen = false;
@@ -591,7 +657,11 @@ static void touchAdd(int16_t x, int16_t y) {
   if (!isButton && !inRect(x, y, 44, 270, 280, 110)) {
     return;
   }
-  builderAdd(isButton);
+  s_pickIsButton = isButton;
+  s_pickSlot = -1;
+  s_addOpen = false;
+  s_pickOpen = true;
+  s_dirty = true;
 }
 
 static void touchDetail(uint8_t slot, int16_t x, int16_t y) {
@@ -617,7 +687,8 @@ static void touchDetail(uint8_t slot, int16_t x, int16_t y) {
     return;
   }
   if (inRect(x, y, 40, 56, 288, 40)) {
-    cycleName(slot);
+    s_pickSlot = (int8_t)slot;
+    s_pickOpen = true;
     s_dirty = true;
     return;
   }
@@ -637,7 +708,9 @@ static void touchDetail(uint8_t slot, int16_t x, int16_t y) {
 }
 
 void builderTouch(int16_t x, int16_t y) {
-  if (s_addOpen) {
+  if (s_pickOpen) {
+    touchPicker(x, y);
+  } else if (s_addOpen) {
     touchAdd(x, y);
   } else if (s_openSlot < 0) {
     touchList(x, y);
