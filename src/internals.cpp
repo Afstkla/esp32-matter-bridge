@@ -23,6 +23,11 @@ namespace {
 // The display, as a dimmable light. This one is not a simulation: a level from
 // Home reaches the panel, so it needs to hear about writes, which means the
 // endpoint's priv_data has to be a MatterEndPoint the bridge callback can call.
+//
+// The callback records the wanted state and returns; apply() does the work.
+// attributeChangeCB runs on the CHIP task, and driving the panel from there
+// would put a QSPI command in the middle of the DMA transfer loop() is running
+// on the same bus. Arduino_GFX has no locking of its own.
 class Backlight : public MatterEndPoint {
 public:
   bool attributeChangeCB(uint16_t endpoint_id, uint32_t cluster_id, uint32_t attribute_id,
@@ -38,14 +43,24 @@ public:
     } else {
       return true;
     }
-    panelBrightness(_on ? (uint8_t)max(_level, MIN_BRIGHTNESS) : 0);
-    Serial.printf("internals: backlight on=%d level=%u\n", _on ? 1 : 0, _level);
+    _wanted = true;
     return true;
   }
 
+  void apply() {
+    if (!_wanted || panelAsleep()) {
+      return;
+    }
+    _wanted = false;
+    uint8_t level = _level;
+    panelBrightness(_on ? (level > MIN_BRIGHTNESS ? level : MIN_BRIGHTNESS) : 0);
+    Serial.printf("internals: backlight on=%d level=%u\n", _on ? 1 : 0, level);
+  }
+
 private:
-  bool _on = true;
-  uint8_t _level = 255;
+  volatile bool _wanted = false;
+  volatile bool _on = true;
+  volatile uint8_t _level = 255;
 };
 
 Backlight s_backlight;
@@ -138,17 +153,25 @@ void internalsBegin() {
   }
 }
 
+// Called from loop(), so the stack lock is this end's job: attribute::update()
+// walks the data model, and the CHIP task is walking it too.
 static void publishValue(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId,
                          esp_matter_attr_val_t val) {
   if (endpointId == 0) {
     return;
   }
+  chip::DeviceLayer::PlatformMgr().LockChipStack();
   attribute::update(endpointId, clusterId, attributeId, &val);
+  chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 }
 
 void internalsPoll() {
   static uint32_t lastAt = 0;
-  if (s_parent == nullptr || (lastAt != 0 && millis() - lastAt < POLL_INTERVAL_MS)) {
+  if (s_parent == nullptr) {
+    return;
+  }
+  s_backlight.apply();
+  if (lastAt != 0 && millis() - lastAt < POLL_INTERVAL_MS) {
     return;
   }
   lastAt = millis();

@@ -422,7 +422,20 @@ static uint8_t pageCount() {
   return pages < 1 ? 1 : pages;
 }
 
+// Measured, not guessed: at ~11 KB free the device stopped failing cleanly and
+// started asserting inside the SPI driver instead, because a page slide is the
+// largest allocation it ever asks for and mbedTLS wants memory at the same time.
+// A slot is worth 1.8 KB as a sensor and up to 4 KB as something controllable,
+// so refuse well before the edge rather than just past it.
+static const uint32_t MIN_FREE_HEAP = 20000;
+
 bool builderAdd(uint8_t type, uint8_t preset) {
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < MIN_FREE_HEAP) {
+    Serial.printf("ADD refused, %u bytes free and %u needed\n", (unsigned)heap,
+                  (unsigned)MIN_FREE_HEAP);
+    return false;
+  }
   int8_t claimed = claimSlot();
   if (claimed < 0) {
     Serial.println("ADD full");
