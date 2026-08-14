@@ -86,15 +86,36 @@ static void openPairingWindow() {
   Serial.printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
 }
 
-static void drawPairingScreen() {
-  QRCode qr;
-  uint8_t buffer[qrcode_getBufferSize(4)];
-  qrcode_initText(&qr, buffer, 4, ECC_LOW, pairingPayload().c_str());
+// The payload decides how much grid it needs. A larger version than it calls
+// for is not more robust, only finer: the same picture in smaller modules, which
+// is harder for a phone to resolve. So take the first one the payload fits in.
+static const uint8_t QR_MAX_VERSION = 4;
+static const int16_t QR_BOX_PX = 340;
 
+static bool buildQr(QRCode *qr, uint8_t *buffer, const char *payload) {
+  for (uint8_t version = 1; version <= QR_MAX_VERSION; version++) {
+    if (qrcode_initText(qr, buffer, version, ECC_LOW, payload) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void drawPairingScreen() {
   Arduino_Canvas &g = panelCanvas();
   g.fillScreen(COL_BLACK);
 
-  const int16_t scale = 8;
+  QRCode qr;
+  uint8_t buffer[qrcode_getBufferSize(QR_MAX_VERSION)];
+  if (!buildQr(&qr, buffer, pairingPayload().c_str())) {
+    drawCentredText(200, "pairing code too long to show", 1, COL_WARN);
+    panelFlush();
+    return;
+  }
+
+  // A quiet zone of four modules a side is what the spec asks for, so the code
+  // occupies size + 8 modules and the module size falls out of the space.
+  const int16_t scale = QR_BOX_PX / (qr.size + 8);
   const int16_t quiet = 4 * scale;
   const int16_t box = qr.size * scale + 2 * quiet;
   const int16_t x0 = (PANEL_W - box) / 2;
@@ -207,6 +228,16 @@ static void runCommand(const String &cmd) {
     }
     builderSetOnOff((uint8_t)cmd.substring(3, space).toInt(),
                     cmd.substring(space + 1).toInt() != 0);
+  } else if (cmd.startsWith("flag ")) {
+    builderToggleFlag((uint8_t)cmd.substring(5).toInt());
+  } else if (cmd.startsWith("value ")) {
+    int space = cmd.indexOf(' ', 6);
+    if (space < 0) {
+      Serial.println("ERR usage: value <slot> <up|down>");
+      return;
+    }
+    builderNudgeValue((uint8_t)cmd.substring(6, space).toInt(),
+                      cmd.substring(space + 1) == "up" ? 1 : -1);
   } else if (cmd.startsWith("remove ")) {
     builderRemove((uint8_t)cmd.substring(7).toInt());
   } else if (cmd == "swipe left" || cmd == "swipe right") {
@@ -216,17 +247,28 @@ static void runCommand(const String &cmd) {
                   (unsigned long)(millis() - at));
   } else if (cmd == "reset slots") {
     builderReset();
-  } else if (cmd == "add button") {
-    builderAdd(true);
-  } else if (cmd == "add level") {
-    builderAdd(false);
+  } else if (cmd.startsWith("add ")) {
+    String want = cmd.substring(4);
+    for (uint8_t type = 0; type < ACC_TYPE_COUNT; type++) {
+      if (want.equalsIgnoreCase(accessoryTypeName(type))) {
+        builderAdd(type);
+        return;
+      }
+    }
+    Serial.printf("ERR unknown type '%s'\n", want.c_str());
+  } else if (cmd == "types") {
+    for (uint8_t type = 0; type < ACC_TYPE_COUNT; type++) {
+      Serial.printf("TYPE %u %s\n", type, accessoryTypeName(type));
+    }
   } else if (cmd == "slots") {
     for (uint8_t i = 0; i < builderSlotCount(); i++) {
       if (!builderSlotUsed(i)) {
         continue;
       }
-      Serial.printf("SLOT %u %s %s %u on=%d\n", i, builderIsButton(i) ? "button" : "level",
-                    builderLabel(i), builderLevel(i), builderOnOff(i) ? 1 : 0);
+      char state[28];
+      builderDescribe(i, state, sizeof(state));
+      Serial.printf("SLOT %u %s %s | %s\n", i, accessoryTypeName(builderType(i)),
+                    builderLabel(i), state);
     }
   } else if (cmd == "qr") {
     s_showQr = !s_showQr;

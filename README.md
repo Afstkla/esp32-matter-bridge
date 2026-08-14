@@ -4,9 +4,8 @@ A Matter **bridge** on an ESP32-S3 with a round AMOLED touchscreen. It presents
 itself to Apple Home (or any Matter controller) as a hub, and the accessories
 behind it are configured on the device's own screen — no app, no recompile.
 
-Add a button or a dimmable level from the touchscreen, name it by tapping, and
-it appears in Home under that name. Press the on-screen button and a HomeKit
-automation fires.
+Pick a device type on the touchscreen, give it a name, and it appears in Home
+under that name. Press the on-screen button and a HomeKit automation fires.
 
 ## Why a bridge
 
@@ -53,11 +52,14 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
 - **QR screen** — top right corner of the tile grid, and only there. A hotspot
   that outlives its screen silently eats taps meant for whatever replaced it.
 - **Tile grid** — one tile per accessory, six to a page. **Swipe left or right**
-  to change page; the pages slide across (~200 ms) and the dots at the bottom
+  to change page; the pages slide across (~140 ms) and the dots at the bottom
   show where you are.
-- **`+` tile** — add a button or a level, then pick its name. It appears in Home
-  within a second or two; no restart.
-- **Tap an accessory** — press it, toggle it, or nudge its level ±10%.
+- **`+` tile** — pick a device type, then a name. It appears in Home within a
+  second or two; no restart. Eight types are on offer: `Button`, `Light`,
+  `Dimmer`, `Outlet`, `Contact`, `Motion`, `Temp`, `Humidity`. The first four
+  you operate; the last four report a reading you set from the screen.
+- **Tap an accessory** — press it, toggle it, nudge its level ±10%, or move a
+  sensor's reading. What the screen offers follows from the device type.
 - **Tap the name** — opens the same name picker: the same six-to-a-page grid of
   tiles, swipe to page through it. Only free names are offered — duplicates are
   legal in Matter but miserable to tell apart in the Home app. The chosen name
@@ -95,7 +97,10 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | --- | --- |
 | `diag` | commissioning state, WiFi, IPv6, fabric count |
 | `slots` | list accessories |
-| `add button` / `add level` | add an accessory |
+| `types` | list the device types on offer |
+| `add <type>` | add an accessory, e.g. `add Dimmer` |
+| `flag N` | flip a contact or motion sensor |
+| `value N up\|down` | move a temperature or humidity reading |
 | `remove N` | delete an accessory |
 | `swipe left` / `swipe right` | change page, animation included |
 | `reset slots` | back to the default six (restarts) |

@@ -30,8 +30,14 @@ static esp_err_t identificationCb(identification::callback_type_t type, uint16_t
 
 static void eventCb(const ChipDeviceEvent *event, intptr_t arg) {}
 
+// What the bridge calls itself. Only the node label is ours to set here: the
+// vendor and product strings are compiled into the prebuilt CHIP libraries.
+static const char *DEVICE_NAME = "Genie";
+
 bool bridgeBegin() {
   node::config_t node_config;
+  strlcpy(node_config.root_node.basic_information.node_label, DEVICE_NAME,
+          sizeof(node_config.root_node.basic_information.node_label));
   node_t *node = node::create(&node_config, attributeCb, identificationCb);
   if (node == nullptr) {
     Serial.println("bridge: node create failed");
@@ -138,20 +144,139 @@ endpoint_t *BridgedAccessory::createNode(const char *name, uint16_t endpointId) 
   return endpoint;
 }
 
-bool BridgedAccessory::beginSwitch(const char *name, uint16_t endpointId) {
+namespace {
+struct TypeInfo {
+  const char *name;
+  AccessoryUi ui;
+  const char *unit;
+  int16_t step;
+  int16_t min;
+  int16_t max;
+};
+
+// Indexed by AccessoryType. Sensor ranges are the ones Apple will show without
+// complaint rather than the full attribute range, which reaches -273 C.
+const TypeInfo TYPES[ACC_TYPE_COUNT] = {
+    {"Button", UI_PRESS, "", 0, 0, 0},
+    {"Light", UI_ONOFF, "", 0, 0, 0},
+    {"Dimmer", UI_LEVEL, "", 0, 0, 0},
+    {"Outlet", UI_ONOFF, "", 0, 0, 0},
+    {"Contact", UI_FLAG, "", 0, 0, 0},
+    {"Motion", UI_FLAG, "", 0, 0, 0},
+    {"Temp", UI_VALUE, "C", 50, -2000, 6000},
+    {"Humidity", UI_VALUE, "%", 100, 0, 10000},
+};
+
+const TypeInfo &info(uint8_t type) {
+  return TYPES[type < ACC_TYPE_COUNT ? type : ACC_BUTTON];
+}
+}  // namespace
+
+AccessoryUi accessoryUi(uint8_t type) {
+  return info(type).ui;
+}
+
+const char *accessoryTypeName(uint8_t type) {
+  return info(type).name;
+}
+
+const char *accessoryUnit(uint8_t type) {
+  return info(type).unit;
+}
+
+int16_t accessoryStep(uint8_t type) {
+  return info(type).step;
+}
+
+int16_t accessoryMin(uint8_t type) {
+  return info(type).min;
+}
+
+int16_t accessoryMax(uint8_t type) {
+  return info(type).max;
+}
+
+// Initial readings are carried in the cluster config rather than written after
+// enable, because an endpoint built before esp_matter::start() has no attribute
+// storage to write to yet.
+static esp_err_t addDeviceType(uint8_t type, endpoint_t *endpoint, bool on, uint8_t level,
+                               bool flag, int16_t value) {
+  switch (type) {
+    case ACC_BUTTON: {
+      generic_switch::config_t config;
+      // The cluster aborts creation unless exactly one of the latching/momentary
+      // features is already declared, so this cannot be added afterwards.
+      // Declaring it also brings the position attributes and the InitialPress event.
+      config.switch_cluster.feature_flags =
+          cluster::switch_cluster::feature::momentary_switch::get_id();
+      return generic_switch::add(endpoint, &config);
+    }
+    case ACC_DIMMER: {
+      dimmable_light::config_t config;
+      config.on_off.on_off = on;
+      config.on_off_lighting.start_up_on_off = nullptr;
+      config.level_control.current_level = level;
+      config.level_control_lighting.start_up_current_level = nullptr;
+      return dimmable_light::add(endpoint, &config);
+    }
+    case ACC_LIGHT: {
+      on_off_light::config_t config;
+      config.on_off.on_off = on;
+      config.on_off_lighting.start_up_on_off = nullptr;
+      return on_off_light::add(endpoint, &config);
+    }
+    case ACC_OUTLET: {
+      on_off_plug_in_unit::config_t config;
+      config.on_off.on_off = on;
+      config.on_off_lighting.start_up_on_off = nullptr;
+      return on_off_plug_in_unit::add(endpoint, &config);
+    }
+    case ACC_CONTACT: {
+      contact_sensor::config_t config;
+      config.boolean_state.state_value = flag;
+      return contact_sensor::add(endpoint, &config);
+    }
+    case ACC_MOTION: {
+      occupancy_sensor::config_t config;
+      config.occupancy_sensing.occupancy = flag ? 1 : 0;
+      // Like the switch cluster, this one refuses to be created without a
+      // sensing technology declared, and aborts rather than returning an error.
+      config.occupancy_sensing.feature_flags =
+          cluster::occupancy_sensing::feature::passive_infrared::get_id();
+      return occupancy_sensor::add(endpoint, &config);
+    }
+    case ACC_TEMPERATURE: {
+      temperature_sensor::config_t config;
+      config.temperature_measurement.measured_value = nullable<int16_t>(value);
+      return temperature_sensor::add(endpoint, &config);
+    }
+    case ACC_HUMIDITY: {
+      humidity_sensor::config_t config;
+      config.relative_humidity_measurement.measured_value = nullable<uint16_t>((uint16_t)value);
+      return humidity_sensor::add(endpoint, &config);
+    }
+    default:
+      return ESP_ERR_INVALID_ARG;
+  }
+}
+
+bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId) {
+  if (type >= ACC_TYPE_COUNT) {
+    Serial.printf("bridge: unknown device type %u\n", type);
+    return false;
+  }
   LiveEdit edit;
   endpoint_t *endpoint = createNode(name, endpointId);
   if (endpoint == nullptr) {
     return false;
   }
 
-  generic_switch::config_t config;
-  // The cluster aborts creation unless exactly one of the latching/momentary
-  // features is already declared, so this cannot be added afterwards. Declaring
-  // it also brings the position attributes and the InitialPress event.
-  config.switch_cluster.feature_flags = cluster::switch_cluster::feature::momentary_switch::get_id();
-  if (generic_switch::add(endpoint, &config) != ESP_OK) {
-    Serial.println("bridge: generic_switch add failed");
+  _type = type;
+  if (accessoryUi(type) == UI_VALUE && _value == 0) {
+    _value = type == ACC_HUMIDITY ? 5000 : 2100;
+  }
+  if (addDeviceType(type, endpoint, _on, _level, _flag, _value) != ESP_OK) {
+    Serial.printf("bridge: %s add failed\n", accessoryTypeName(type));
     return false;
   }
   if (!publish(endpoint, edit)) {
@@ -160,36 +285,38 @@ bool BridgedAccessory::beginSwitch(const char *name, uint16_t endpointId) {
 
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
-  Serial.printf("bridge: switch '%s' on endpoint %u\n", _name, getEndPointId());
+  Serial.printf("bridge: %s '%s' on endpoint %u\n", accessoryTypeName(type), _name,
+                getEndPointId());
   return true;
 }
 
-bool BridgedAccessory::beginLight(const char *name, bool on, uint8_t level, uint16_t endpointId) {
-  LiveEdit edit;
-  endpoint_t *endpoint = createNode(name, endpointId);
-  if (endpoint == nullptr) {
-    return false;
+bool BridgedAccessory::setFlag(bool active) {
+  if (!_started || _flag == active) {
+    return _started;
   }
+  _flag = active;
+  if (_type == ACC_MOTION) {
+    esp_matter_attr_val_t val = esp_matter_bitmap8(active ? 1 : 0);
+    return updateAttributeVal(OccupancySensing::Id, OccupancySensing::Attributes::Occupancy::Id,
+                              &val);
+  }
+  esp_matter_attr_val_t val = esp_matter_bool(active);
+  return updateAttributeVal(BooleanState::Id, BooleanState::Attributes::StateValue::Id, &val);
+}
 
-  dimmable_light::config_t config;
-  config.on_off.on_off = on;
-  config.on_off_lighting.start_up_on_off = nullptr;
-  config.level_control.current_level = level;
-  config.level_control_lighting.start_up_current_level = nullptr;
-  if (dimmable_light::add(endpoint, &config) != ESP_OK) {
-    Serial.println("bridge: dimmable_light add failed");
-    return false;
+bool BridgedAccessory::setValue(int16_t hundredths) {
+  if (!_started || _value == hundredths) {
+    return _started;
   }
-  if (!publish(endpoint, edit)) {
-    return false;
+  _value = hundredths;
+  if (_type == ACC_HUMIDITY) {
+    esp_matter_attr_val_t val = esp_matter_nullable_uint16((uint16_t)hundredths);
+    return updateAttributeVal(RelativeHumidityMeasurement::Id,
+                              RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val);
   }
-
-  _on = on;
-  _level = level;
-  setEndPointId(endpoint::get_id(endpoint));
-  _started = true;
-  Serial.printf("bridge: light '%s' on endpoint %u\n", _name, getEndPointId());
-  return true;
+  esp_matter_attr_val_t val = esp_matter_nullable_int16(hundredths);
+  return updateAttributeVal(TemperatureMeasurement::Id,
+                            TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
 }
 
 bool BridgedAccessory::remove() {
