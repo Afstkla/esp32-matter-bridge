@@ -60,6 +60,32 @@ static String formattedPairingCode() {
   return raw.substring(0, 4) + "-" + raw.substring(4, 7) + "-" + raw.substring(7);
 }
 
+static const uint32_t PAIRING_WINDOW_SECONDS = 180;
+
+static bool pairingWindowOpen() {
+  chip::DeviceLayer::PlatformMgr().LockChipStack();
+  bool open =
+      chip::Server::GetInstance().GetCommissioningWindowManager().IsCommissioningWindowOpen();
+  chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+  return open;
+}
+
+// A device that already holds a fabric advertises nothing — no commissioning
+// window, no BLE — so the code on the pairing screen is unusable unless the
+// screen asks for a window itself. Opening it takes a deliberate gesture
+// (the corner tap) because anyone who can read the code is standing here.
+static void openPairingWindow() {
+  if (pairingWindowOpen()) {
+    return;
+  }
+  chip::DeviceLayer::PlatformMgr().LockChipStack();
+  CHIP_ERROR err =
+      chip::Server::GetInstance().GetCommissioningWindowManager().OpenBasicCommissioningWindow(
+          chip::System::Clock::Seconds32(PAIRING_WINDOW_SECONDS));
+  chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+  Serial.printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
+}
+
 static void drawPairingScreen() {
   QRCode qr;
   uint8_t buffer[qrcode_getBufferSize(4)];
@@ -86,10 +112,11 @@ static void drawPairingScreen() {
   drawCentredText(y0 + box + 22, formattedPairingCode(), 2, COL_WHITE);
 
   bool online = WiFi.status() == WL_CONNECTED;
-  const char *hint = !online          ? "No WiFi - pairing cannot work"
-                     : Matter.isDeviceCommissioned() ? "Already paired"
-                                                     : "Scan in Apple Home";
-  drawCentredText(y0 + box + 52, hint, 1, online ? COL_DIM : COL_WARN);
+  bool listening = pairingWindowOpen();
+  const char *hint = !online     ? "No WiFi - pairing cannot work"
+                     : listening ? "Scan in Apple Home"
+                                 : "Pairing window shut - reopen from the grid";
+  drawCentredText(y0 + box + 52, hint, 1, online && listening ? COL_DIM : COL_WARN);
   if (online) {
     drawCentredText(y0 + box + 68, WiFi.SSID() + "  " + WiFi.localIP().toString(), 1,
                     COL_NET);
@@ -205,6 +232,9 @@ static void runCommand(const String &cmd) {
     }
   } else if (cmd == "qr") {
     s_showQr = !s_showQr;
+    if (s_showQr) {
+      openPairingWindow();
+    }
     drawScreen();
     Serial.printf("SCREEN %s\n", s_showQr ? "qr" : "builder");
   } else if (cmd == "state") {
@@ -213,11 +243,7 @@ static void runCommand(const String &cmd) {
     Serial.printf("CODE %s\n", Matter.getManualPairingCode().c_str());
     Serial.printf("QR %s\n", Matter.getOnboardingQRCodeUrl().c_str());
   } else if (cmd == "window") {
-    chip::DeviceLayer::PlatformMgr().LockChipStack();
-    CHIP_ERROR err = chip::Server::GetInstance().GetCommissioningWindowManager().OpenBasicCommissioningWindow(
-        chip::System::Clock::Seconds32(180));
-    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-    Serial.printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
+    openPairingWindow();
   } else if (cmd == "decommission") {
     Matter.decommission();
     Serial.println("DECOMMISSIONED");
@@ -325,6 +351,7 @@ static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
     // Only the tile grid gives up its top right corner. Any screen below it
     // owns that space, and a global hotspot silently eats whatever it lands on.
     s_showQr = true;
+    openPairingWindow();
     drawScreen();
   } else {
     builderTouch(x0, y0);
@@ -372,7 +399,8 @@ void setup() {
   builderResume();
 
   s_showQr = !Matter.isDeviceCommissioned();
-  if (!Matter.isDeviceCommissioned()) {
+  if (s_showQr) {
+    openPairingWindow();
     Serial.printf("CODE %s\n", Matter.getManualPairingCode().c_str());
     Serial.printf("QR %s\n", Matter.getOnboardingQRCodeUrl().c_str());
   }
