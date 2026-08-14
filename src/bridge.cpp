@@ -260,6 +260,26 @@ static esp_err_t addDeviceType(uint8_t type, endpoint_t *endpoint, bool on, uint
   }
 }
 
+// Matter puts ClusterRevision, FeatureMap, AttributeList, AcceptedCommandList
+// and GeneratedCommandList on every cluster, so the attribute count runs far
+// ahead of the handful an accessory actually uses: a contact sensor carries 18
+// records to publish one bool, at roughly 100 bytes of heap apiece. Running out
+// of heap is how this board fails, so the count is worth printing.
+//
+// Deliberately not a heap delta: the stack allocates and frees on its own
+// threads while an endpoint is being built, and a measured endpoint came out
+// 608 bytes to the good. Use the heap figure from `diag` instead.
+static void countContents(endpoint_t *endpoint, uint16_t *clusters, uint16_t *attributes) {
+  *clusters = 0;
+  *attributes = 0;
+  for (cluster_t *c = cluster::get_first(endpoint); c != nullptr; c = cluster::get_next(c)) {
+    (*clusters)++;
+    for (attribute_t *a = attribute::get_first(c); a != nullptr; a = attribute::get_next(a)) {
+      (*attributes)++;
+    }
+  }
+}
+
 bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId) {
   if (type >= ACC_TYPE_COUNT) {
     Serial.printf("bridge: unknown device type %u\n", type);
@@ -285,8 +305,10 @@ bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId
 
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
-  Serial.printf("bridge: %s '%s' on endpoint %u\n", accessoryTypeName(type), _name,
-                getEndPointId());
+  uint16_t clusters = 0, attributes = 0;
+  countContents(endpoint, &clusters, &attributes);
+  Serial.printf("bridge: %s '%s' on endpoint %u (%u clusters, %u attributes)\n",
+                accessoryTypeName(type), _name, getEndPointId(), clusters, attributes);
   return true;
 }
 
