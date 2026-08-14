@@ -8,6 +8,7 @@ usual use is to draw a screen and capture it in one go. The board is never
 reset: the point is to photograph the state it is already in.
 """
 import base64
+import binascii
 import glob
 import os
 import sys
@@ -50,7 +51,14 @@ def read_dump(ser, timeout=120.0):
         if raw.startswith("SCREENDUMP END"):
             if size is None:
                 raise SystemExit("dump ended before its header arrived")
-            data = base64.b64decode("".join(payload))
+            # A partly-dropped line leaves the joined payload unaligned, which
+            # b64decode raises on. That is the same lost-bytes case as a short
+            # decode, so it takes the same retry rather than a traceback.
+            try:
+                data = base64.b64decode("".join(payload))
+            except binascii.Error as exc:
+                print(f"  ! payload did not decode ({exc}) — line dropped")
+                return None
             expected = size[0] * size[1] * 2
             if len(data) != expected:
                 print(f"  ! {len(data)} bytes, expected {expected} — line dropped")

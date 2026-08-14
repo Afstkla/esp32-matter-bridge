@@ -191,11 +191,17 @@ void panelWake() {
 //
 // draw_bitmap only queues the transfer, so the wait is not optional: the DMA is
 // still reading the framebuffer when it returns, and the caller's next draw
-// would race it. The timeout is a backstop — a failed transfer never fires the
-// callback, and the ui task must not hang on it.
+// would race it. The timeout is a backstop so the ui task cannot hang.
 void panelFlush() {
-  ESP_ERROR_CHECK_WITHOUT_ABORT(
-      esp_lcd_panel_draw_bitmap(s_panel, 0, 0, PANEL_W, PANEL_H, s_frame));
+  // A flush that timed out still gets its callback eventually. Clearing that
+  // stale give here is what stops the wait below from being satisfied by the
+  // previous frame, which would put every flush from then on one frame out of
+  // phase — drawing over a buffer the DMA is still reading.
+  xSemaphoreTake(s_flushDone, 0);
+  if (ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_draw_bitmap(
+          s_panel, 0, 0, PANEL_W, PANEL_H, s_frame)) != ESP_OK) {
+    return;
+  }
   if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
     ESP_LOGE(TAG, "flush did not complete");
   }
