@@ -33,7 +33,13 @@ def send(ser, line):
     ser.flush()
 
 
-def read_dump(ser, timeout=60.0):
+def read_dump(ser, timeout=120.0):
+    """One dump, or None if the console dropped part of it.
+
+    The board streams faster than USB always carries, so a short line means
+    bytes went missing. Decoding that anyway would produce a plausible but
+    wrong picture, which is worse than no picture at all.
+    """
     deadline = time.time() + timeout
     payload = []
     size = None
@@ -44,7 +50,12 @@ def read_dump(ser, timeout=60.0):
         if raw.startswith("SCREENDUMP END"):
             if size is None:
                 raise SystemExit("dump ended before its header arrived")
-            return size, base64.b64decode("".join(payload))
+            data = base64.b64decode("".join(payload))
+            expected = size[0] * size[1] * 2
+            if len(data) != expected:
+                print(f"  ! {len(data)} bytes, expected {expected} — line dropped")
+                return None
+            return size, data
         if raw.startswith("SCREENDUMP "):
             parts = raw.split()
             size = (int(parts[1]), int(parts[2]))
@@ -56,9 +67,6 @@ def read_dump(ser, timeout=60.0):
 
 def to_image(size, data):
     width, height = size
-    expected = width * height * 2
-    if len(data) != expected:
-        raise SystemExit(f"got {len(data)} bytes, expected {expected}")
     # Big-endian RGB565, straight off the wire — see theme.h.
     image = Image.new("RGB", size)
     pixels = image.load()
@@ -85,9 +93,15 @@ def main():
             print(f"  > {command}")
             send(ser, command)
             time.sleep(0.5)
-        ser.reset_input_buffer()
-        send(ser, "screendump")
-        size, data = read_dump(ser)
+        for attempt in range(3):
+            ser.reset_input_buffer()
+            send(ser, "screendump")
+            dump = read_dump(ser)
+            if dump:
+                break
+        else:
+            raise SystemExit("three dumps in a row came back short")
+    size, data = dump
     to_image(size, data).save(out)
     print(f"  < {out} {size[0]}x{size[1]}")
 

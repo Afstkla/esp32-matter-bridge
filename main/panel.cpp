@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
@@ -12,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 
@@ -31,7 +33,11 @@ static const int PIN_LCD_D0 = 4;
 static const int PIN_LCD_D1 = 5;
 static const int PIN_LCD_D2 = 6;
 static const int PIN_LCD_D3 = 7;
-static const unsigned int LCD_CLOCK_HZ = 80 * 1000 * 1000;
+// The wire would take 80 MHz, but the frame is DMA'd straight out of PSRAM and
+// the EDMA cannot refill the SPI FIFO that fast: at 80 MHz every flush ends in
+// "DMA TX underflow detected" and a black panel. 40 MHz is 20 MB/s, just above
+// the ~18 MB/s the Arduino build actually sustained.
+static const unsigned int LCD_CLOCK_HZ = 40 * 1000 * 1000;
 
 static const int CO5300_COL_OFFSET = 16;
 static const uint8_t PANEL_ON_BRIGHTNESS = 180;
@@ -47,6 +53,7 @@ static i2c_master_dev_handle_t s_tca = nullptr;
 static i2c_master_dev_handle_t s_touch = nullptr;
 static uint16_t *s_frame = nullptr;
 static bool s_asleep = false;
+static SemaphoreHandle_t s_flushDone = nullptr;
 
 // EXIO0 = LCD_RESET, EXIO1 = TP_RESET, EXIO2 = DSI_PWR_EN. Neither reset line
 // reaches a GPIO on this board, so the panel driver is created without a reset
@@ -77,7 +84,16 @@ static void touchInit() {
   ESP_LOGE(TAG, "no touch response at 0x15");
 }
 
+// esp_lcd fires this once per frame, on the last chunk of the transfer.
+static bool onFlushDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *) {
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(s_flushDone, &woken);
+  return woken == pdTRUE;
+}
+
 static void displayInit() {
+  s_flushDone = xSemaphoreCreateBinary();
+
   spi_bus_config_t bus = {};
   bus.data0_io_num = PIN_LCD_D0;
   bus.data1_io_num = PIN_LCD_D1;
@@ -88,7 +104,7 @@ static void displayInit() {
   // SPI3 cannot DMA out of PSRAM on this chip, and the framebuffer lives there.
   ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
 
-  esp_lcd_panel_io_spi_config_t io = CO5300_PANEL_IO_QSPI_CONFIG(PIN_LCD_CS, nullptr, nullptr);
+  esp_lcd_panel_io_spi_config_t io = CO5300_PANEL_IO_QSPI_CONFIG(PIN_LCD_CS, onFlushDone, nullptr);
   io.pclk_hz = LCD_CLOCK_HZ;
   io.flags.psram_dma_direct = 1;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io, &s_io));
@@ -172,9 +188,17 @@ void panelWake() {
 // CS asserted across the chunks, and the CO5300 leaves the panel black if a
 // frame arrives as separately addressed writes. Nothing byte-swaps on the way —
 // the buffer is already big-endian (see theme.h), which is what the wire wants.
+//
+// draw_bitmap only queues the transfer, so the wait is not optional: the DMA is
+// still reading the framebuffer when it returns, and the caller's next draw
+// would race it. The timeout is a backstop — a failed transfer never fires the
+// callback, and the ui task must not hang on it.
 void panelFlush() {
   ESP_ERROR_CHECK_WITHOUT_ABORT(
       esp_lcd_panel_draw_bitmap(s_panel, 0, 0, PANEL_W, PANEL_H, s_frame));
+  if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
+    ESP_LOGE(TAG, "flush did not complete");
+  }
 }
 
 // Prints the touch registers whenever they change. The digitiser reports
@@ -244,8 +268,9 @@ static int cmdBright(int argc, char **argv) {
     return 1;
   }
   int level = atoi(argv[1]);
-  panelBrightness((uint8_t)(level < 0 ? 0 : level > 255 ? 255 : level));
-  printf("BRIGHT %d\n", level);
+  uint8_t clamped = (uint8_t)(level < 0 ? 0 : level > 255 ? 255 : level);
+  panelBrightness(clamped);
+  printf("BRIGHT %d\n", clamped);
   return 0;
 }
 
@@ -270,7 +295,6 @@ static int cmdTouchdump(int argc, char **argv) {
 // panel shows machine-checkable: tools/screenshot.py turns this into a PNG.
 static int cmdScreendump(int argc, char **argv) {
   const size_t chunk = 768;
-  // Static: the console task's stack has no room for a kilobyte of line buffer.
   static char line[4 * (chunk / 3) + 2];
   const uint8_t *bytes = (const uint8_t *)s_frame;
 
@@ -280,6 +304,13 @@ static int cmdScreendump(int argc, char **argv) {
     size_t written = 0;
     mbedtls_base64_encode((unsigned char *)line, sizeof(line), &written, bytes + offset, take);
     printf("%s\n", line);
+    // The console loses whole lines on a dump this size, and pacing does not
+    // stop it — smaller lines, fsync and yields were all measured and none
+    // helped, so the loss is on the host side of the USB link. fsync at least
+    // keeps the device's own buffer empty; screenshot.py checks the length it
+    // got and asks again, which in practice takes one or two tries.
+    fflush(stdout);
+    fsync(fileno(stdout));
   }
   printf("SCREENDUMP END\n");
   return 0;
