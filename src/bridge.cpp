@@ -100,6 +100,15 @@ static bool publish(esp_matter::endpoint_t *endpoint, const LiveEdit &edit) {
   return true;
 }
 
+endpoint_t *bridgeAggregator() {
+  return s_aggregator;
+}
+
+bool bridgePublish(esp_matter::endpoint_t *endpoint) {
+  LiveEdit edit;
+  return publish(endpoint, edit);
+}
+
 // The name buffer is a member rather than a local because the attribute keeps
 // referring to it, and it is sized once here so later renames always fit.
 //
@@ -269,7 +278,7 @@ static esp_err_t addDeviceType(uint8_t type, endpoint_t *endpoint, bool on, uint
 // Deliberately not a heap delta: the stack allocates and frees on its own
 // threads while an endpoint is being built, and a measured endpoint came out
 // 608 bytes to the good. Use the heap figure from `diag` instead.
-static void countContents(endpoint_t *endpoint, uint16_t *clusters, uint16_t *attributes) {
+void bridgeCount(endpoint_t *endpoint, uint16_t *clusters, uint16_t *attributes) {
   *clusters = 0;
   *attributes = 0;
   for (cluster_t *c = cluster::get_first(endpoint); c != nullptr; c = cluster::get_next(c)) {
@@ -306,7 +315,7 @@ bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
   uint16_t clusters = 0, attributes = 0;
-  countContents(endpoint, &clusters, &attributes);
+  bridgeCount(endpoint, &clusters, &attributes);
   Serial.printf("bridge: %s '%s' on endpoint %u (%u clusters, %u attributes)\n",
                 accessoryTypeName(type), _name, getEndPointId(), clusters, attributes);
   return true;

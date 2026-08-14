@@ -8,6 +8,7 @@
 
 #include "bridge.h"
 #include "builder.h"
+#include "internals.h"
 #include "keys.h"
 #include "net.h"
 #include "panel.h"
@@ -430,6 +431,7 @@ void setup() {
   builderBegin();
   bridgeStart();
   builderResume();
+  internalsBegin();
 
   s_showQr = !Matter.isDeviceCommissioned();
   if (s_showQr) {
@@ -457,6 +459,7 @@ void loop() {
 
   pollSerial();
   pollDiag();
+  internalsPoll();
   pollKeys();
   pollTouch();
   if (builderNeedsRedraw()) {

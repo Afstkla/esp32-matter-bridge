@@ -35,6 +35,19 @@ void pmuReport() {
                 s_pmu.isCharging() ? 1 : 0, s_pmu.getTemperature());
 }
 
+PmuStatus pmuStatus() {
+  PmuStatus s{};
+  if (!s_pmuReady) {
+    return s;
+  }
+  s.present = true;
+  s.percent = (uint8_t)constrain(s_pmu.getBatteryPercent(), 0, 100);
+  s.celsius = s_pmu.getTemperature();
+  s.charging = s_pmu.isCharging();
+  s.onUsb = s_pmu.isVbusIn();
+  return s;
+}
+
 bool keyBootPressed() {
   static bool wasDown = false;
   bool down = digitalRead(PIN_KEY_BOOT) == LOW;

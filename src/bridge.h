@@ -16,6 +16,18 @@ bool bridgeBegin();
 // endpoint classes are out of the picture.
 bool bridgeStart();
 
+// The aggregator every bridged accessory hangs from.
+esp_matter::endpoint_t *bridgeAggregator();
+
+// Registers an endpoint with the running stack. Endpoints built before
+// esp_matter::start() are registered as it comes up; one built afterwards has
+// to be enabled by hand.
+bool bridgePublish(esp_matter::endpoint_t *endpoint);
+
+// Counts what an endpoint is made of. Most of it is bookkeeping Matter puts on
+// every cluster rather than anything the accessory uses.
+void bridgeCount(esp_matter::endpoint_t *endpoint, uint16_t *clusters, uint16_t *attributes);
+
 // The Matter device types this bridge can expose, in the order the picker
 // offers them: the things you operate first, then the things that only report.
 enum AccessoryType : uint8_t {
