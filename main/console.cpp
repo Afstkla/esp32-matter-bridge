@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "esp_heap_caps.h"
+#include "nvs.h"
 
 void consoleRegisterCmd(const char *name, const char *help, esp_console_cmd_func_t func) {
   const esp_console_cmd_t cmd = {
@@ -26,6 +27,18 @@ static int cmdHeap(int argc, char **argv) {
   return 0;
 }
 
+static int cmdNvs(int argc, char **argv) {
+  nvs_stats_t stats;
+  if (nvs_get_stats(nullptr, &stats) != ESP_OK) {
+    printf("NVS stats unavailable\n");
+    return 1;
+  }
+  printf("NVS used=%u free=%u total=%u namespaces=%u\n", (unsigned)stats.used_entries,
+         (unsigned)stats.free_entries, (unsigned)stats.total_entries,
+         (unsigned)stats.namespace_count);
+  return 0;
+}
+
 void consoleStart() {
   esp_console_repl_t *repl = nullptr;
   esp_console_repl_config_t replConfig = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -37,6 +50,7 @@ void consoleStart() {
   esp_console_register_help_command();
   consoleRegisterCmd("ping", "Reply PONG", cmdPing);
   consoleRegisterCmd("heap", "Show free internal and PSRAM heap", cmdHeap);
+  consoleRegisterCmd("nvs", "Show NVS entry usage", cmdNvs);
 
   ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }

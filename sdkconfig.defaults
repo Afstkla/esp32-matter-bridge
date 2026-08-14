@@ -20,3 +20,31 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_FREERTOS_HZ=1000
 
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Matter's data model is the single largest consumer of heap on this device and
+# the Arduino build ran out of internal DRAM at four accessories. Everything the
+# stack allocates dynamically goes to PSRAM instead.
+CONFIG_ESP_MATTER_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=32
+CONFIG_MAX_FABRICS=5
+
+# BLE is only ever the commissioning transport: NimBLE with the roles a
+# peripheral never plays left out, torn down once a fabric is joined.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_USE_BLE_ONLY_FOR_COMMISSIONING=y
+
+# Operational discovery is IPv6 mDNS (CHIP's own minimal responder, which is on
+# by default). Stock lwIP has neither SLAAC nor room for the addresses a
+# commissioned node ends up holding.
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
+
+CONFIG_MBEDTLS_HKDF_C=y
+
+# app_main builds the data model, and the WiFi/IP events CHIP subscribes to run
+# on the system event task; both overflow the stock stacks.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096

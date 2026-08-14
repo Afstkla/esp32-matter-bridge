@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#include "bridge.h"
 #include "console.h"
 #include "keys.h"
 #include "panel.h"
@@ -22,6 +23,9 @@ extern "C" void app_main(void) {
     ESP_LOGE(TAG, "panel init failed");
   }
   keysInit();
+
+  bridgeBegin();
+  bridgeStart();
   consoleStart();
   ESP_LOGI(TAG, "genie booted");
 }
