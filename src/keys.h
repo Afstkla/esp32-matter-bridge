@@ -13,6 +13,7 @@ void pmuReport();
 
 struct PmuStatus {
   bool present;
+  uint16_t millivolts;
   uint8_t percent;
   float celsius;  // the PMU die, not the room
   bool charging;

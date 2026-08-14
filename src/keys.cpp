@@ -41,6 +41,7 @@ PmuStatus pmuStatus() {
     return s;
   }
   s.present = true;
+  s.millivolts = s_pmu.getBattVoltage();
   s.percent = (uint8_t)constrain(s_pmu.getBatteryPercent(), 0, 100);
   s.celsius = s_pmu.getTemperature();
   s.charging = s_pmu.isCharging();
