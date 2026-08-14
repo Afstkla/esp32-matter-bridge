@@ -35,19 +35,15 @@ Nothing else is required. Buttons use the two keys already on the board:
 pio run -e matter-amoled-1-8 -t upload
 ```
 
-Then give it WiFi. Credentials live in NVS and never enter the source tree.
-(The device also advertises over BLE for commissioning, so a controller can
-provision it instead — but the serial route is easier to script.)
+A fresh board has no network and does not need one. It advertises over BLE, and
+the controller hands over WiFi credentials as part of pairing: Matter stores
+them itself and rejoins on every boot, so nothing here keeps a second copy and
+no credential ever enters the source tree.
 
-```sh
-uv run --with pyserial python tools/mctl.py 'ssid My Network' 'pass my-passphrase'
-```
+**2.4 GHz only** — the ESP32-S3 has no 5 GHz radio, and a 5 GHz-only SSID fails
+silently.
 
-Two separate commands because an SSID and a passphrase may both contain spaces.
-The device saves them and restarts. **2.4 GHz only** — the ESP32-S3 has no
-5 GHz radio, and a 5 GHz-only SSID fails silently.
-
-Once it is on WiFi the screen shows a pairing QR. Scan it in Apple Home. You
+The screen shows a pairing QR at first boot. Scan it in Apple Home. You
 need a home hub (HomePod or Apple TV) for Matter, and Home will warn that the
 accessory is uncertified — this firmware uses the Matter **test** vendor ID
 `0xFFF1`, which Apple accepts and Google does not.
@@ -105,7 +101,7 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | `reset slots` | back to the default six (restarts) |
 | `click N` | fire a switch press |
 | `on N 0\|1`, `level N 0-255` | drive a level accessory |
-| `ssid <name>`, `pass <key>`, `wifi`, `forget` | WiFi credentials |
+| `wifi` | which network the driver actually joined |
 | `pairing`, `state`, `decommission` | Matter commissioning |
 | `window` | reopen a 3-minute commissioning window without unpairing |
 | `sleep`, `wake`, `idle N` | screen |

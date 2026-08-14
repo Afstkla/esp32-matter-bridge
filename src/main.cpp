@@ -9,7 +9,7 @@
 #include "bridge.h"
 #include "builder.h"
 #include "keys.h"
-#include "netcfg.h"
+#include "net.h"
 #include "panel.h"
 #include "theme.h"
 
@@ -111,15 +111,14 @@ static void drawPairingScreen() {
 
   drawCentredText(y0 + box + 22, formattedPairingCode(), 2, COL_WHITE);
 
-  bool online = WiFi.status() == WL_CONNECTED;
+  NetStatus net = netStatus();
   bool listening = pairingWindowOpen();
-  const char *hint = !online     ? "No WiFi - pairing cannot work"
-                     : listening ? "Scan in Apple Home"
-                                 : "Pairing window shut - reopen from the grid";
-  drawCentredText(y0 + box + 52, hint, 1, online && listening ? COL_DIM : COL_WARN);
-  if (online) {
-    drawCentredText(y0 + box + 68, WiFi.SSID() + "  " + WiFi.localIP().toString(), 1,
-                    COL_NET);
+  const char *hint = !net.connected ? "No WiFi - a commissioner can supply it"
+                     : listening    ? "Scan in Apple Home"
+                                    : "Pairing window shut - reopen from the grid";
+  drawCentredText(y0 + box + 52, hint, 1, listening ? COL_DIM : COL_WARN);
+  if (net.connected) {
+    drawCentredText(y0 + box + 68, String(net.ssid) + "  " + net.ip, 1, COL_NET);
   }
   drawCentredText(PANEL_H - 20, "tap to continue", 1, COL_FAINT);
   panelFlush();
@@ -161,10 +160,9 @@ static void printStage(const CommissioningStage &s) {
   Serial.printf("DIAG t=%lus ble_adv=%d window=%d wifi_prov=%d wifi_conn=%d fabrics=%u\n",
                 (unsigned long)(millis() / 1000), s.bleAdvertising, s.windowOpen,
                 s.wifiProvisioned, s.wifiConnected, s.fabrics);
-  Serial.printf("DIAG ssid=%s rssi=%d ch=%d ip=%s ll6=%s g6=%s\n", WiFi.SSID().c_str(),
-                WiFi.RSSI(), WiFi.channel(), WiFi.localIP().toString().c_str(),
-                WiFi.linkLocalIPv6().toString().c_str(),
-                WiFi.globalIPv6().toString().c_str());
+  NetStatus net = netStatus();
+  Serial.printf("DIAG ssid=%s rssi=%d ch=%u ip=%s ll6=%s\n", net.ssid, net.rssi, net.channel,
+                net.ip, net.linkLocal);
 }
 
 static void pollDiag() {
@@ -260,15 +258,9 @@ static void runCommand(const String &cmd) {
     s_idleTimeoutMs = (uint32_t)cmd.substring(5).toInt() * 1000;
     noteActivity();
     Serial.printf("IDLE %u\n", s_idleTimeoutMs / 1000);
-  } else if (cmd.startsWith("ssid ")) {
-    netcfgSetSsid(cmd.substring(5));
-  } else if (cmd.startsWith("pass ")) {
-    netcfgSetPassword(cmd.substring(5));
   } else if (cmd == "wifi") {
-    Serial.printf("WIFI stored='%s' status=%d ip=%s\n", netcfgSsid().c_str(),
-                  (int)WiFi.status(), WiFi.localIP().toString().c_str());
-  } else if (cmd == "forget") {
-    netcfgForget();
+    NetStatus net = netStatus();
+    Serial.printf("WIFI joined='%s' ip=%s rssi=%d\n", net.ssid, net.ip, net.rssi);
   } else if (cmd == "nvs") {
     nvs_stats_t st;
     if (nvs_get_stats(NULL, &st) == ESP_OK) {
@@ -394,7 +386,6 @@ void setup() {
   keysInit();
 
   builderBegin();
-  netcfgJoin(0);
   bridgeStart();
   builderResume();
 
@@ -412,7 +403,7 @@ void loop() {
   static bool lastCommissioned = false;
   static bool lastOnline = false;
   bool commissioned = Matter.isDeviceCommissioned();
-  bool online = WiFi.status() == WL_CONNECTED;
+  bool online = netStatus().connected;
   if (commissioned != lastCommissioned || online != lastOnline) {
     lastCommissioned = commissioned;
     lastOnline = online;
