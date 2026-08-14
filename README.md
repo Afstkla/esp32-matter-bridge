@@ -55,7 +55,8 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
   to change page; the pages slide across (~140 ms) and the dots at the bottom
   show where you are.
 - **`+` tile** — pick a device type, then a name. It appears in Home within a
-  second or two; no restart. Eight types are on offer: `Button`, `Light`,
+  second or two; no restart. A fresh device starts empty and holds six, which
+  is what the board carries alongside its own internals accessory. Eight types are on offer: `Button`, `Light`,
   `Dimmer`, `Outlet`, `Contact`, `Motion`, `Temp`, `Humidity`. The first four
   you operate; the last four report a reading you set from the screen.
 - **Tap an accessory** — press it, toggle it, nudge its level ±10%, or move a
@@ -103,7 +104,7 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | `value N up\|down` | move a temperature or humidity reading |
 | `remove N` | delete an accessory |
 | `swipe left` / `swipe right` | change page, animation included |
-| `reset slots` | back to the default six (restarts) |
+| `reset slots` | remove every accessory (restarts) |
 | `click N` | fire a switch press |
 | `on N 0\|1`, `level N 0-255` | drive a level accessory |
 | `wifi` | which network the driver actually joined |
@@ -113,6 +114,18 @@ uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 | `nvs`, `power`, `touchdump` | diagnostics |
 
 `listen N` and `sleep N` are client-side helpers for scripting a session.
+
+## Genie's own internals
+
+The board reports itself as one further accessory, and it is the only one here
+that is not invented: a **composed device** — a bridged node carrying a child
+endpoint per function, whose `PartsList` is what tells a controller they are one
+thing. Apple Home draws it as a single tile. Inside are the PMU die
+temperature, the battery percentage, and the display brightness, which really
+does dim the panel.
+
+It costs about 8 KB of heap, which is most of the headroom on this board, and
+is why six accessories is the cap rather than a dozen.
 
 ## What works, and what does not
 
@@ -125,6 +138,7 @@ Established on real hardware against Apple Home:
 | Device-initiated switch press triggers an automation | yes, ~2 s |
 | Device-initiated on/off triggers an automation | yes |
 | Device-initiated **brightness** triggers an automation | **no** |
+| A composed device shown as one grouped tile | yes |
 
 Home offers no "brightness changed" automation trigger — only on/off. A
 dimmable light therefore cannot act as a volume knob that drives automations.
@@ -150,6 +164,14 @@ real debugging time. Longer write-up in [docs/matter-notes.md](docs/matter-notes
   `boot_app0.bin` to that fixed offset regardless of the partition CSV.
 - **`Matter.begin()` cannot start a bridge.** It requires a private flag that
   only the library's own endpoint classes can set.
+- **An endpoint costs 1.8-4 KB of heap.** esp_matter builds its data model at
+  runtime rather than from ZAP-generated tables in flash, so every cluster's
+  mandatory `ClusterRevision`, `FeatureMap`, `AttributeList` and command lists
+  are heap records: a contact sensor holds 18 attributes to publish one bool.
+  `emberAfSetDynamicEndpoint()`, which the upstream bridge example uses with
+  static metadata, is declared in the shipped headers but not compiled into the
+  prebuilt libraries. Run out and the SPI driver asserts mid-transfer rather
+  than failing cleanly.
 - **Progress logs do not exist.** The prebuilt libs are compiled at log level
   ERROR, so `ESP_LOGI` inside CHIP is compiled out. Errors still appear.
 

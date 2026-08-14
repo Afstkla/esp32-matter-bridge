@@ -7,7 +7,9 @@
 #include "panel.h"
 #include "theme.h"
 
-static const uint8_t MAX_SLOTS = 12;
+// Six is what the board proved it can carry alongside the internals accessory:
+// twelve endpoints all told, which measured stable, where fifteen did not.
+static const uint8_t MAX_SLOTS = 6;
 
 static const int16_t PANEL_W = 368;
 static const int16_t PANEL_H = 448;
@@ -305,22 +307,6 @@ static bool startAccessory(uint8_t slot) {
   return true;
 }
 
-// One of each of the interesting shapes, so a fresh device shows what it can do
-// before anything has been added by hand.
-static void seedDefaults() {
-  static const Slot DEFAULTS[] = {
-      {ACC_BUTTON, 4, 0},       // Scene
-      {ACC_BUTTON, 5, 0},       // Movie
-      {ACC_DIMMER, 1, 0},       // Lamp
-      {ACC_LIGHT, 0, 0},        // Lights
-      {ACC_OUTLET, 8, 0},       // Coffee
-      {ACC_TEMPERATURE, 19, 0}  // Garden
-  };
-  s_count = sizeof(DEFAULTS) / sizeof(DEFAULTS[0]);
-  memcpy(s_slot, DEFAULTS, sizeof(DEFAULTS));
-  persistSlots();
-}
-
 static bool loadSlots() {
   size_t stored = s_prefs.getBytesLength(SLOTS_KEY);
   if (stored < sizeof(Slot) || stored > sizeof(s_slot) || stored % sizeof(Slot) != 0) {
@@ -331,11 +317,11 @@ static bool loadSlots() {
   return true;
 }
 
+// Nothing is seeded. A fresh device carries only its own internals, and the
+// grid opens on the one tile that adds something.
 void builderBegin() {
   s_prefs.begin("builder", false);
-  if (!loadSlots()) {
-    seedDefaults();
-  }
+  loadSlots();
   bridgeBegin();
 }
 
@@ -425,9 +411,10 @@ static uint8_t pageCount() {
 // Measured, not guessed: at ~11 KB free the device stopped failing cleanly and
 // started asserting inside the SPI driver instead, because a page slide is the
 // largest allocation it ever asks for and mbedTLS wants memory at the same time.
-// A slot is worth 1.8 KB as a sensor and up to 4 KB as something controllable,
-// so refuse well before the edge rather than just past it.
-static const uint32_t MIN_FREE_HEAP = 20000;
+// A slot is worth 1.8 KB as a sensor and up to 4 KB as something controllable.
+// MAX_SLOTS is the real limit; this is the backstop for whatever else the stack
+// happens to be holding at the time.
+static const uint32_t MIN_FREE_HEAP = 16000;
 
 bool builderAdd(uint8_t type, uint8_t preset) {
   uint32_t heap = ESP.getFreeHeap();
