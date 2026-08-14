@@ -20,12 +20,12 @@ public:
     _endpointId = id;
   }
 
-  // Takes the stack lock: this is called from the ui task and attribute::update
-  // walks the data model the CHIP task is walking too.
+  // Takes the stack lock when it needs one: attribute::update walks the data
+  // model the CHIP task is walking too.
   bool updateAttributeVal(uint32_t clusterId, uint32_t attributeId, esp_matter_attr_val_t *val);
 
-  // Runs on the CHIP task with the stack lock held. Record and return; do not
-  // touch the panel or anything else the ui task owns.
+  // Runs on the CHIP task; do not touch the panel or anything else the ui task
+  // owns.
   virtual void attributeChanged(uint32_t clusterId, uint32_t attributeId,
                                 esp_matter_attr_val_t *val) = 0;
 

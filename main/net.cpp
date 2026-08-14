@@ -16,7 +16,7 @@ NetStatus netStatus() {
     return s;
   }
   s.connected = true;
-  snprintf(s.ssid, sizeof(s.ssid), "%s", (const char *)ap.ssid);
+  strlcpy(s.ssid, (const char *)ap.ssid, sizeof(s.ssid));
   s.rssi = ap.rssi;
   s.channel = ap.primary;
 

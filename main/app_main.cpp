@@ -24,8 +24,11 @@ extern "C" void app_main(void) {
   }
   keysInit();
 
-  bridgeBegin();
-  bridgeStart();
   consoleStart();
+  // bridgeStart() is what registers the Matter commands, so a silent failure
+  // here would look like a firmware that shipped without them.
+  if (!bridgeBegin() || !bridgeStart()) {
+    ESP_LOGE(TAG, "Matter did not come up; its commands are missing");
+  }
   ESP_LOGI(TAG, "genie booted");
 }

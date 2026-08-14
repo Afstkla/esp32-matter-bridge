@@ -54,8 +54,31 @@ struct CommissioningStage {
   uint8_t fabrics;
 };
 
-// The stack lock is the caller's business: an event callback already runs
-// under it and the lock is not recursive.
+// Takes the stack lock only when it is both needed and not already held: the
+// CHIP task holds it whenever it calls into us and the mutex is not recursive,
+// and before esp_matter::start() there is no CHIP task to race with. Same guard
+// esp_matter's own ScopedChipStackLock uses.
+namespace {
+class StackLock {
+public:
+  StackLock()
+      : _taken(esp_matter::is_started() &&
+               !chip::DeviceLayer::PlatformMgr().IsChipStackLockedByCurrentThread()) {
+    if (_taken) {
+      chip::DeviceLayer::PlatformMgr().LockChipStack();
+    }
+  }
+  ~StackLock() {
+    if (_taken) {
+      chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    }
+  }
+
+private:
+  bool _taken;
+};
+}  // namespace
+
 static CommissioningStage readStage() {
   CommissioningStage s{};
   s.bleAdvertising = chip::DeviceLayer::ConnectivityMgr().IsBLEAdvertisingEnabled();
@@ -66,18 +89,6 @@ static CommissioningStage readStage() {
   s.fabrics = chip::Server::GetInstance().GetFabricTable().FabricCount();
   return s;
 }
-
-namespace {
-class StackLock {
-public:
-  StackLock() {
-    chip::DeviceLayer::PlatformMgr().LockChipStack();
-  }
-  ~StackLock() {
-    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-  }
-};
-}  // namespace
 
 static void printStage(const CommissioningStage &s) {
   printf("DIAG t=%us ble_adv=%d window=%d wifi_prov=%d wifi_conn=%d fabrics=%u\n",
@@ -164,7 +175,9 @@ static bool pairingCode(char *out, size_t size) {
 }
 
 static void printPairing() {
-  char code[chip::kManualSetupLongCodeCharLength + 1] = {0};
+  // The generator refuses a buffer without room for the check digit as well as
+  // the terminator, so the code length is not the buffer size.
+  char code[chip::kManualSetupLongCodeCharLength + 2] = {0};
   char payload[chip::QRCodeBasicSetupPayloadGenerator::kMaxQRCodeBase38RepresentationLength + 1] = {
       0};
   if (pairingCode(code, sizeof(code))) {
@@ -240,39 +253,16 @@ bool bridgeStart() {
   return true;
 }
 
-// Endpoints built before esp_matter::start() are registered by the stack as it
-// comes up. One built afterwards has to be enabled by hand, and every
-// data-model write while the stack runs has to hold its lock.
-namespace {
-class LiveEdit {
-public:
-  LiveEdit() : _live(esp_matter::is_started()) {
-    if (_live) {
-      chip::DeviceLayer::PlatformMgr().LockChipStack();
-    }
-  }
-  ~LiveEdit() {
-    if (_live) {
-      chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-    }
-  }
-  bool live() const {
-    return _live;
-  }
-
-private:
-  bool _live;
-};
-}  // namespace
-
 bool MatterEndPoint::updateAttributeVal(uint32_t clusterId, uint32_t attributeId,
                                         esp_matter_attr_val_t *val) {
-  LiveEdit edit;
+  StackLock lock;
   return esp_matter::attribute::update(_endpointId, clusterId, attributeId, val) == ESP_OK;
 }
 
-static bool publish(esp_matter::endpoint_t *endpoint, const LiveEdit &edit) {
-  if (!edit.live()) {
+// Endpoints built before esp_matter::start() are registered by the stack as it
+// comes up. One built afterwards has to be enabled by hand.
+static bool publish(esp_matter::endpoint_t *endpoint) {
+  if (!esp_matter::is_started()) {
     return true;
   }
   esp_err_t err = endpoint::enable(endpoint);
@@ -288,8 +278,8 @@ endpoint_t *bridgeAggregator() {
 }
 
 bool bridgePublish(esp_matter::endpoint_t *endpoint) {
-  LiveEdit edit;
-  return publish(endpoint, edit);
+  StackLock lock;
+  return publish(endpoint);
 }
 
 // The name buffer is a member rather than a local because the attribute keeps
@@ -311,13 +301,14 @@ endpoint_t *BridgedAccessory::createNode(const char *name, uint16_t endpointId) 
   const uint8_t flags = ENDPOINT_FLAG_DESTROYABLE | ENDPOINT_FLAG_BRIDGE;
   endpoint_t *endpoint = nullptr;
   if (endpointId != 0) {
-    endpoint = bridged_node::resume(node::get(), &config, flags, endpointId, (void *)this);
+    endpoint = bridged_node::resume(node::get(), &config, flags, endpointId,
+                                    static_cast<MatterEndPoint *>(this));
     if (endpoint == nullptr) {
       ESP_LOGW(TAG, "endpoint %u could not be resumed, taking a new one", endpointId);
     }
   }
   if (endpoint == nullptr) {
-    endpoint = bridged_node::create(node::get(), &config, flags, (void *)this);
+    endpoint = bridged_node::create(node::get(), &config, flags, static_cast<MatterEndPoint *>(this));
   }
   if (endpoint == nullptr) {
     ESP_LOGE(TAG, "bridged node create failed");
@@ -477,7 +468,7 @@ bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId
     ESP_LOGE(TAG, "unknown device type %u", type);
     return false;
   }
-  LiveEdit edit;
+  StackLock lock;
   endpoint_t *endpoint = createNode(name, endpointId);
   if (endpoint == nullptr) {
     return false;
@@ -491,7 +482,7 @@ bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId
     ESP_LOGE(TAG, "%s add failed", accessoryTypeName(type));
     return false;
   }
-  if (!publish(endpoint, edit)) {
+  if (!publish(endpoint)) {
     return false;
   }
 
@@ -537,7 +528,7 @@ bool BridgedAccessory::remove() {
   if (!_started) {
     return false;
   }
-  LiveEdit edit;
+  StackLock lock;
   endpoint_t *endpoint = endpoint::get(node::get(), getEndPointId());
   if (endpoint == nullptr) {
     ESP_LOGE(TAG, "endpoint %u not found", getEndPointId());
