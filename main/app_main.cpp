@@ -2,6 +2,7 @@
 #include "nvs_flash.h"
 
 #include "console.h"
+#include "panel.h"
 
 static const char *TAG = "genie";
 
@@ -16,6 +17,9 @@ static void initNvs() {
 
 extern "C" void app_main(void) {
   initNvs();
+  if (!panelInit()) {
+    ESP_LOGE(TAG, "panel init failed");
+  }
   consoleStart();
   ESP_LOGI(TAG, "genie booted");
 }
