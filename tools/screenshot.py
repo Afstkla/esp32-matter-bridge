@@ -11,6 +11,7 @@ import base64
 import binascii
 import glob
 import os
+import re
 import sys
 import time
 
@@ -18,6 +19,7 @@ import serial
 from PIL import Image
 
 BAUD = 115200
+BASE64_LINE = re.compile(r"[A-Za-z0-9+/=]+")
 
 
 def find_port():
@@ -68,7 +70,9 @@ def read_dump(ser, timeout=120.0):
             parts = raw.split()
             size = (int(parts[1]), int(parts[2]))
             payload = []
-        elif size is not None:
+        elif size is not None and BASE64_LINE.fullmatch(raw):
+            # Log lines from other tasks land in the middle of the dump. None of
+            # them are base64, so the alphabet is what tells payload from noise.
             payload.append(raw)
     raise SystemExit("timed out waiting for SCREENDUMP END")
 

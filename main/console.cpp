@@ -43,6 +43,9 @@ void consoleStart() {
   esp_console_repl_t *repl = nullptr;
   esp_console_repl_config_t replConfig = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
   replConfig.prompt = "genie> ";
+  // `add` builds a Matter endpoint on this task, which does not fit the 4 KB
+  // the default config asks for.
+  replConfig.task_stack_size = 8192;
 
   esp_console_dev_usb_serial_jtag_config_t jtagConfig = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&jtagConfig, &replConfig, &repl));
