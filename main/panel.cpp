@@ -255,7 +255,7 @@ void panelFlush() {
       break;
     }
     if (attempt == 0) {
-      ESP_LOGW(TAG, "frame damaged (%" PRIu32 " faulted chunks), flushing it again", faulted);
+      ESP_LOGW(TAG, "frame damaged, %" PRIu32 " chunk(s) faulted; flushing it again", faulted);
     }
   }
 }

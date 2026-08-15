@@ -19,8 +19,11 @@ corrupted 32 KB chunk on the wire, a `W` log line, and — because the count tel
 `panelFlush()` the frame it just sent is damaged — one extra ~18 ms flush.
 
 The count advances in the drain loops, i.e. in whatever task called into the
-panel IO, never in an ISR. On this firmware that is only ever the ui task (the
-panel is single-task-owned), which is also the only reader, so a plain
-`volatile uint32_t` is all the synchronisation it needs.
+panel IO, never in an ISR — on this firmware only ever the ui task, since the
+panel is single-task-owned. Readers are another matter: the `power` console
+command prints it from whichever task ran the command, the USB REPL or a network
+console session. One writer and cross-task readers of a `volatile uint32_t` need
+no lock on this target because an aligned 32-bit load or store is atomic; a
+reader can be one increment stale, which is all a diagnostic counter owes anyone.
 
 Remove this override when upstream ESP-IDF fixes the drain accounting; an upstream issue against ESP-IDF is planned.

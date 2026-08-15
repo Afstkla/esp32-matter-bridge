@@ -7,7 +7,7 @@ constexpr int16_t PANEL_H = 448;
 
 bool panelInit();
 
-// Everything below runs on the ui task and nowhere else: one esp_lcd panel IO
+// The two calls below run on the ui task and nowhere else: one esp_lcd panel IO
 // handle carries both the frame and the brightness command, and it is not
 // thread safe. Console commands that want the panel record their intent and
 // let the ui tick apply it.
