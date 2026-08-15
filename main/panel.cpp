@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "driver/spi_master.h"
+#include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_co5300.h"
 #include "esp_lcd_io_spi.h"
@@ -61,17 +62,25 @@ static uint32_t s_lastFlushUs = 0;
 // EXIO0 = LCD_RESET, EXIO1 = DSI_PWR_EN, EXIO2 = TP_RESET. Neither reset line
 // reaches a GPIO on this board, so the panel driver is created without a reset
 // pin and relies on this pulse having already run.
-static void releaseResets() {
-  ESP_ERROR_CHECK(i2cWriteReg(s_tca, 0x03, 0xF8));
-  ESP_ERROR_CHECK(i2cWriteReg(s_tca, 0x01, 0x00));
+//
+// Errors are returned rather than aborted on because this now runs on every
+// wake, not only at boot: a transient NAK here must not reboot an accessory
+// that is live in Apple Home. panelInit() still treats a failure as fatal.
+static esp_err_t releaseResets() {
+  ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x03, 0xF8), TAG, "expander direction");
+  ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x01, 0x00), TAG, "expander low");
   vTaskDelay(pdMS_TO_TICKS(20));
-  ESP_ERROR_CHECK(i2cWriteReg(s_tca, 0x01, 0x07));
+  ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x01, 0x07), TAG, "expander high");
   vTaskDelay(pdMS_TO_TICKS(20));
+  return ESP_OK;
 }
 
 // The same three bits low: DSI_PWR_EN cuts VCI to the module, and the two reset
-// lines go with it so the controller and the digitiser sit in their defined
-// state while unpowered rather than being fed through their protection diodes.
+// lines go with it, which is the low-leakage state for pins whose supply has
+// gone. SDA, SCL and the touch INT stay pulled up regardless — they are shared
+// with the PMU or pulled up off-chip, so nothing here can float them, and they
+// back-feed the dead digitiser through its protection diodes at whatever the
+// pull-ups allow (order 0.4 mA; see the task-2 report).
 static void cutPower() {
   ESP_ERROR_CHECK_WITHOUT_ABORT(i2cWriteReg(s_tca, 0x01, 0x00));
 }
@@ -85,7 +94,7 @@ static void touchInit() {
   for (int attempt = 0; attempt < 25; attempt++) {
     if (i2cReadReg(s_touch, 0xA7, &id, 1) == ESP_OK) {
       ESP_LOGI(TAG, "CST816 chip id 0x%02X after %d ms", id, attempt * 20);
-      ESP_ERROR_CHECK(i2cWriteReg(s_touch, 0xFA, 0x10));
+      ESP_ERROR_CHECK_WITHOUT_ABORT(i2cWriteReg(s_touch, 0xFA, 0x10));
       vTaskDelay(pdMS_TO_TICKS(20));
       return;
     }
@@ -104,11 +113,11 @@ static bool onFlushDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t
 // Everything the CO5300 forgets when VCI goes: SWRESET, MADCTL/COLMOD, the
 // vendor sequence (SLPOUT among it) and DISPON. Roughly 180 ms of mandated
 // delays, which is most of what panelWake() costs.
-static void initController() {
-  ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
-  ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-  ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, CO5300_COL_OFFSET, 0));
-  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
+static esp_err_t initController() {
+  ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset");
+  ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
+  ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(s_panel, CO5300_COL_OFFSET, 0), TAG, "panel gap");
+  return esp_lcd_panel_disp_on_off(s_panel, true);
 }
 
 static void displayInit() {
@@ -144,7 +153,7 @@ static void displayInit() {
   device.vendor_config = &vendor;
   ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(s_io, &device, &s_panel));
 
-  initController();
+  ESP_ERROR_CHECK(initController());
 }
 
 static void registerCommands();
@@ -153,7 +162,7 @@ bool panelInit() {
   i2cInit();
   s_tca = i2cAddDevice(ADDR_TCA9554);
   s_touch = i2cAddDevice(ADDR_CST816);
-  releaseResets();
+  ESP_ERROR_CHECK(releaseResets());
   touchInit();
 
   // 64-byte aligned so the SPI driver DMAs the frame out of PSRAM as it stands
@@ -229,8 +238,15 @@ void panelWake() {
     return;
   }
   int64_t startedAt = esp_timer_get_time();
-  releaseResets();
-  initController();
+  // A wake that cannot bring the module up leaves the screen dark and asleep,
+  // so the next PWR press simply tries again. Aborting instead would reboot a
+  // commissioned accessory — three fabrics' subscriptions dropped — over one
+  // NAK on a bus the PMU is also using.
+  if (releaseResets() != ESP_OK || initController() != ESP_OK) {
+    ESP_LOGE(TAG, "panel wake failed, staying dark");
+    cutPower();
+    return;
+  }
   s_asleep = false;
   panelBrightness(0);
   panelFlush();

@@ -307,10 +307,21 @@ Two consequences, both deliberate:
   it, and `panel wake took N ms` is logged on every wake) instead of the one
   register write it used to be.
 - **Touch cannot wake the device.** The CST816 sits on the same `VCI` domain, so
-  it is unpowered while the screen is off — `touchdump` answers `DUMP read
-  failed`, which is the check that the rail is really down. The **PWR** key is
-  the wake: its PMU interrupt latches, so a press is never missed. Keeping touch
-  alive would mean keeping the rail up, which is most of the saving.
+  it is unpowered while the screen is off — `touchdump` answering `DUMP read
+  failed` is the check that the rail is down. The **PWR** key is the wake: its
+  PMU interrupt latches, so a press is never missed. Keeping touch alive would
+  mean keeping the rail up, which is most of the saving.
+
+**Expected shelf life: not yet measured.** The board has no current sense and
+the AXP2101 no current ADC, and the die temperature was shown to be blind to the
+panel — a fully lit screen moves it 0.3 °C — so nothing on this device can weigh
+the change from the bench. The estimate it is built on is a subtraction: of the
+~50–60 mA measured on battery, the chip's own light-sleep residency accounts for
+only ~11–26 mA, and the module was the only thing left holding the rest. If that
+subtraction is right the saving is roughly half the drain and shelf life about
+doubles; if it is wrong, this changes little. An unplugged soak — mV/hour
+against the ~250 mV/h measured before the change — is the verdict, and it has
+not been run yet.
 
 Battery percent is interpolated from a resting LiPo OCV table, not from the
 AXP2101's fuel gauge, which has no battery model programmed and reported 52% at
