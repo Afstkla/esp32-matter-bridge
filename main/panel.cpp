@@ -1,5 +1,6 @@
 #include "panel.h"
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_co5300.h"
+#include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -206,36 +208,64 @@ void panelWake() {
 // draw_bitmap only queues the transfer, so the wait is not optional: the DMA is
 // still reading the framebuffer when it returns, and the caller's next draw
 // would race it. The timeout is a backstop so the ui task cannot hang.
+//
+// The frame DMAs straight out of PSRAM, and under enough bus contention the
+// EDMA can fail to refill the SPI FIFO even at 40 MHz — a "DMA TX underflow",
+// one garbled chunk on the wire. The wedge that used to follow (the next frame
+// parking forever inside draw_bitmap) was esp_lcd losing count of a
+// faulted-but-consumed result; that is fixed in components/esp_lcd (see its
+// PATCH.md), which also counts those faults — so a damaged frame is now
+// something this function can see and send again. An underflow costs an extra
+// ~18 ms flush instead of leaving a garbled band that stands until the screen
+// next changes, which on a screen that has gone quiet could be a long time.
 void panelFlush() {
-  // A flush that timed out still gets its callback eventually. Clearing that
-  // stale give here is what stops the wait below from being satisfied by the
-  // previous frame, which would put every flush from then on one frame out of
-  // phase — drawing over a buffer the DMA is still reading.
-  xSemaphoreTake(s_flushDone, 0);
   int64_t startedAt = esp_timer_get_time();
-  if (ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_draw_bitmap(
-          s_panel, 0, 0, PANEL_W, PANEL_H, s_frame)) != ESP_OK) {
-    return;
+  // Exactly two attempts: a retry that underflows too would only be a third
+  // chance at the same odds, and the ui task has a watchdog to answer to.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    uint32_t faultsBefore = esp_lcd_spi_underflow_count();
+    // A flush that timed out still gets its callback eventually. Clearing that
+    // stale give here is what stops the wait below from being satisfied by the
+    // previous frame, which would put every flush from then on one frame out of
+    // phase — drawing over a buffer the DMA is still reading.
+    xSemaphoreTake(s_flushDone, 0);
+    if (ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_draw_bitmap(
+            s_panel, 0, 0, PANEL_W, PANEL_H, s_frame)) != ESP_OK) {
+      return;
+    }
+    if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
+      ESP_LOGE(TAG, "flush did not complete");
+    }
+    // The completion callback rides the last chunk, but the chunks' results sit
+    // in esp_lcd's queue until something drains them, and the DMA fault only
+    // surfaces in that drain. Unclaimed, it would surface inside the *next*
+    // frame's CASET — blaming the wrong frame, and never firing at all for the
+    // last frame before the screen goes quiet, which is the frame that matters.
+    // A parameter transfer with no command drains and sends nothing.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(s_io, -1, nullptr, 0));
+    uint32_t faulted = esp_lcd_spi_underflow_count() - faultsBefore;
+    s_lastFlushUs = (uint32_t)(esp_timer_get_time() - startedAt);
+    // This tick of quiet between frames is what makes underflows rare in the
+    // first place: back-to-back frames keep the PSRAM bus saturated, and the
+    // earlier bracket (no yield: glitch by frame 2; taskYIELD(): ~24; one tick:
+    // 160+ clean) was measuring exactly that contention relief. The retry wants
+    // it more than anyone: it follows the one flush known to have lost the bus.
+    vTaskDelay(1);
+    if (faulted == 0) {
+      break;
+    }
+    if (attempt == 0) {
+      ESP_LOGW(TAG, "frame damaged (%" PRIu32 " faulted chunks), flushing it again", faulted);
+    }
   }
-  if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
-    ESP_LOGE(TAG, "flush did not complete");
-  }
-  s_lastFlushUs = (uint32_t)(esp_timer_get_time() - startedAt);
-  // The frame DMAs straight out of PSRAM, and under enough bus contention the
-  // EDMA can fail to refill the SPI FIFO even at 40 MHz — a "DMA TX underflow",
-  // one garbled chunk on the wire. The wedge that used to follow (the next
-  // frame parking forever inside draw_bitmap) was esp_lcd losing count of a
-  // faulted-but-consumed result; that is fixed in components/esp_lcd (see its
-  // PATCH.md), so an underflow is now a one-frame glitch and a W log line.
-  // This tick of quiet between frames is what makes underflows rare in the
-  // first place: back-to-back frames keep the PSRAM bus saturated, and the
-  // earlier bracket (no yield: glitch by frame 2; taskYIELD(): ~24; one tick:
-  // 160+ clean) was measuring exactly that contention relief.
-  vTaskDelay(1);
 }
 
 uint32_t panelLastFlushUs() {
   return s_lastFlushUs;
+}
+
+uint32_t panelUnderflows() {
+  return esp_lcd_spi_underflow_count();
 }
 
 // Prints the touch registers whenever they change. The digitiser reports

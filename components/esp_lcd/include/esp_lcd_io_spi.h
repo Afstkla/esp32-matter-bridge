@@ -57,6 +57,16 @@ typedef struct {
  */
 esp_err_t esp_lcd_new_panel_io_spi(esp_lcd_spi_bus_handle_t bus, const esp_lcd_panel_io_spi_config_t *io_config, esp_lcd_panel_io_handle_t *ret_io);
 
+/**
+ * @brief Transactions recycled after a DMA fault, since boot, across all SPI panel IOs
+ *
+ * PATCHED — not upstream API, part of the local override (see ../PATCH.md). The
+ * count advances in the caller's task context, inside the transaction drain
+ * loops, so a caller that owns the panel can read it before and after a flush to
+ * learn whether what it just sent reached the glass intact.
+ */
+uint32_t esp_lcd_spi_underflow_count(void);
+
 #ifdef __cplusplus
 }
 #endif

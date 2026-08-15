@@ -39,15 +39,25 @@ static esp_err_t panel_io_spi_tx_color(esp_lcd_panel_io_t *io, int lcd_cmd, cons
 // one ahead of reality forever — the next drain then blocks in
 // spi_device_get_trans_result(portMAX_DELAY) on a result that will never
 // arrive. Treating the flagged result as recycled makes a DMA fault cost one
-// corrupted chunk on the wire instead of a permanently wedged caller.
+// corrupted chunk on the wire instead of a permanently wedged caller. The count
+// is what lets the application know the frame it just sent is damaged and flush
+// it again (esp_lcd_spi_underflow_count(), declared in esp_lcd_io_spi.h).
+static volatile uint32_t s_faulted_trans_count;
+
 static esp_err_t lcd_spi_recycle_trans(spi_device_handle_t dev, spi_transaction_t **trans)
 {
     esp_err_t ret = spi_device_get_trans_result(dev, trans, portMAX_DELAY);
     if (ret == ESP_ERR_INVALID_STATE) {
+        s_faulted_trans_count++;
         ESP_LOGW(TAG, "recycled a DMA-faulted transaction");
         ret = ESP_OK;
     }
     return ret;
+}
+
+uint32_t esp_lcd_spi_underflow_count(void)
+{
+    return s_faulted_trans_count;
 }
 
 static esp_err_t panel_io_spi_del(esp_lcd_panel_io_t *io);

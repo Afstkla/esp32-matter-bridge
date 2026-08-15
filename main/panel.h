@@ -18,6 +18,10 @@ void panelBrightness(uint8_t level);
 // it is the number to watch when the power configuration changes.
 uint32_t panelLastFlushUs();
 
+// PSRAM DMA underflows the display driver has caught since boot. Each one cost
+// a re-flush; a number that climbs is the bus asking for a slower pixel clock.
+uint32_t panelUnderflows();
+
 // Screen only — the CPU stays awake because Matter needs the WiFi link up.
 void panelSleep();
 void panelWake();

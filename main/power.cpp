@@ -84,9 +84,9 @@ static void report() {
   esp_wifi_get_ps(&ps);
   esp_pm_config_t pm = {};
   esp_pm_get_configuration(&pm);
-  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d wifi_ps=%s flush=%.1fms\n", pm.min_freq_mhz,
-         pm.max_freq_mhz, pm.light_sleep_enable ? 1 : 0, s_awakeHeld ? 1 : 0, psName(ps),
-         panelLastFlushUs() / 1000.0);
+  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d wifi_ps=%s flush=%.1fms underflows=%u\n",
+         pm.min_freq_mhz, pm.max_freq_mhz, pm.light_sleep_enable ? 1 : 0, s_awakeHeld ? 1 : 0,
+         psName(ps), panelLastFlushUs() / 1000.0, (unsigned)panelUnderflows());
   pmuReport();
 }
 
