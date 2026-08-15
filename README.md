@@ -270,9 +270,23 @@ own `NO_LIGHT_SLEEP` lock while advertising, and this firmware advertises
 until a fabric is joined. Once commissioned, BLE tears down
 (`CONFIG_USE_BLE_ONLY_FOR_COMMISSIONING`) and the lock releases with it.
 
+The station is forced to `WIFI_MODE_STA` at startup. `esp_wifi` keeps its mode
+in NVS and restores it at init, and CHIP only ever upgrades a stored AP mode to
+APSTA — so a SoftAP left behind by any earlier firmware survives every reflash
+and beacons forever, pinning the `wifi` `APB_FREQ_MAX` lock and blocking both
+modem and light sleep. `power` reports `wifi_mode=`; anything but `sta` is that
+bug returning.
+
+Battery percent is interpolated from a resting LiPo OCV table, not from the
+AXP2101's fuel gauge, which has no battery model programmed and reported 52% at
+3.58 V on a cell that died half an hour later. Voltage sags under load, so the
+estimate reads low while the device is busy and the raw `mV` stays the number
+to trust.
+
 Drain is measured with `battlog`: a 144-entry ring in NVS, sampled every 10
 minutes (`mv`/`pct`/`flags` with USB/charging/boot bits), giving a rolling
-24-hour window. It survives reboots and dumps oldest-first.
+24-hour window. It survives reboots and dumps oldest-first. Entries older than
+this change carry the fuel gauge's numbers and are not comparable.
 
 `power` (debug surface) reports the live PM config, WiFi PS mode, last flush
 time and PMU reading; `power locks` dumps the PM lock table; `power

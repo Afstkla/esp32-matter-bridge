@@ -60,6 +60,28 @@ static const char *psName(wifi_ps_type_t ps) {
   return ps == WIFI_PS_NONE ? "none" : ps == WIFI_PS_MIN_MODEM ? "min" : "max";
 }
 
+static const char *modeName(wifi_mode_t mode) {
+  return mode == WIFI_MODE_STA     ? "sta"
+         : mode == WIFI_MODE_AP    ? "ap"
+         : mode == WIFI_MODE_APSTA ? "apsta"
+                                   : "null";
+}
+
+// esp_wifi persists its mode in NVS and restores it at init, so an APSTA left
+// behind by some earlier firmware outlives every reflash. CHIP only ever asks
+// for station mode (EnableStationMode upgrades AP to APSTA but never downgrades
+// it), so the leftover SoftAP kept beaconing on the station's channel, held the
+// wifi APB_FREQ_MAX lock permanently, and neither modem nor light sleep could
+// engage — measured as 12/12 lock samples Active, and 0/12 the moment the mode
+// was forced back to STA on the same boot. Writing it once heals NVS too.
+static void dropStaleSoftAp() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) == ESP_OK && mode != WIFI_MODE_STA) {
+    printf("POWER wifi mode was %s, forcing station-only\n", modeName(mode));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
+  }
+}
+
 static bool setWifiPs(const char *mode) {
   wifi_ps_type_t ps;
   if (strcmp(mode, "none") == 0) {
@@ -84,9 +106,12 @@ static void report() {
   esp_wifi_get_ps(&ps);
   esp_pm_config_t pm = {};
   esp_pm_get_configuration(&pm);
-  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d wifi_ps=%s flush=%.1fms underflows=%u\n",
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  esp_wifi_get_mode(&mode);
+  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d wifi_ps=%s wifi_mode=%s flush=%.1fms "
+         "underflows=%u\n",
          pm.min_freq_mhz, pm.max_freq_mhz, pm.light_sleep_enable ? 1 : 0, s_awakeHeld ? 1 : 0,
-         psName(ps), panelLastFlushUs() / 1000.0, (unsigned)panelUnderflows());
+         psName(ps), modeName(mode), panelLastFlushUs() / 1000.0, (unsigned)panelUnderflows());
   pmuReport();
 }
 
@@ -165,6 +190,8 @@ void powerBegin() {
   if (s_awakeOnUsb != nullptr && esp_pm_lock_acquire(s_awakeOnUsb) == ESP_OK) {
     s_awakeHeld = true;
   }
+
+  dropStaleSoftAp();
 
   ESP_ERROR_CHECK(nvs_open(NAMESPACE, NVS_READWRITE, &s_nvs));
   uint8_t ps = (uint8_t)DEFAULT_PS;

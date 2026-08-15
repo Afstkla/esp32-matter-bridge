@@ -26,7 +26,6 @@ static const uint8_t REG_ADC_SYS_H = 0x3A;
 static const uint8_t REG_ADC_SYS_L = 0x3B;
 static const uint8_t REG_ADC_TEMP_H = 0x3C;
 static const uint8_t REG_ADC_TEMP_L = 0x3D;
-static const uint8_t REG_BAT_PERCENT = 0xA4;
 static const uint8_t REG_INTEN2 = 0x41;
 static const uint8_t REG_INTSTS1 = 0x48;
 static const uint8_t REG_INTSTS2 = 0x49;
@@ -116,8 +115,30 @@ static float pmuTempC() {
   return 22.0f + (7274.0f - raw) / 20.0f;
 }
 
-static int pmuBattPercent() {
-  return pmuBatteryPresent() ? pmuReadReg(REG_BAT_PERCENT) : -1;
+// The AXP2101's own fuel gauge has no battery model programmed — battlog has it
+// reporting 52% at 3.58 V on a cell that died half an hour later, and 50% at
+// 4.19 V — so percent is derived from voltage instead. Resting-OCV curve for a
+// single LiPo cell:
+// under load the pack sags and this reads low, which is the safe direction to
+// be wrong in, and the error shrinks as the device spends more time asleep.
+static int percentFromMv(uint16_t mv) {
+  static const struct {
+    uint16_t mv;
+    uint8_t pct;
+  } CURVE[] = {{3300, 0},  {3500, 8},  {3600, 20}, {3700, 38},
+               {3800, 55}, {3900, 70}, {4000, 85}, {4150, 100}};
+
+  if (mv <= CURVE[0].mv) {
+    return 0;
+  }
+  for (size_t i = 1; i < sizeof(CURVE) / sizeof(CURVE[0]); i++) {
+    if (mv < CURVE[i].mv) {
+      uint16_t loMv = CURVE[i - 1].mv, hiMv = CURVE[i].mv;
+      uint8_t loPct = CURVE[i - 1].pct, hiPct = CURVE[i].pct;
+      return loPct + (mv - loMv) * (hiPct - loPct) / (hiMv - loMv);
+    }
+  }
+  return 100;
 }
 
 void keysInit() {
@@ -159,7 +180,7 @@ void pmuReport() {
   uint16_t battMv = pmuBattMv();
   uint16_t vbusMv = pmuVbusMv();
   uint16_t sysMv = pmuSysMv();
-  int pct = pmuBattPercent();
+  int pct = battMv == 0 ? -1 : percentFromMv(battMv);
   bool vbusIn = pmuVbusIn();
   bool charging = pmuCharging();
   float tempC = pmuTempC();
@@ -193,7 +214,7 @@ PmuStatus pmuStatus() {
   readAt = now;
   resetPmuFault();
   uint16_t battMv = pmuBattMv();
-  int percent = pmuBattPercent();
+  int percent = battMv == 0 ? 0 : percentFromMv(battMv);
   float tempC = pmuTempC();
   bool charging = pmuCharging();
   bool onUsb = pmuVbusIn();
