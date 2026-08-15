@@ -12,9 +12,7 @@ still returns its result — flagged, so `get_trans_result` reports
 error *after* consuming the result but *without* decrementing
 `num_trans_inflight`, so the counter runs one ahead of reality forever and the
 next drain blocks in `portMAX_DELAY` on a result that will never arrive. On
-this board that was a permanently wedged ui task roughly one 40-swipe run in
-three, near-certain with DFS enabled. With the patch, an underflow costs one
+this board that was an intermittently but reproducibly wedged ui task, readily triggered with DFS enabled. With the patch, an underflow costs one
 corrupted 32 KB chunk on the wire for one frame and a `W` log line.
 
-Remove this override when upstream ESP-IDF fixes the drain accounting; a draft
-issue lives in the private scratchpad UPSTREAM.md.
+Remove this override when upstream ESP-IDF fixes the drain accounting; an upstream issue against ESP-IDF is planned.

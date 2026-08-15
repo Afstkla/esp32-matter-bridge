@@ -57,7 +57,7 @@ idf.py build
 ```
 
 Pinned toolchain: **ESP-IDF 5.5.5** at `~/esp/esp-idf` (the version
-`espressif/esp_matter` ^1.6.0 recommends). Managed components
+`espressif/esp_matter` ^1.6.0 recommends). See the [official Espressif get-started guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.5/esp32s3/get-started/) for installing ESP-IDF v5.5.5. Managed components
 (`main/idf_component.yml`, pulled on first build): `espressif/esp_matter`
 ^1.6.0 and `espressif/esp_lcd_co5300` ^2.1.0.
 
