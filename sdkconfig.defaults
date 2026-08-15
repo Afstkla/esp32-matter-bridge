@@ -44,6 +44,13 @@ CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
 
 CONFIG_MBEDTLS_HKDF_C=y
 
+# The whole point of the port: dynamic frequency scaling plus automatic light
+# sleep, configured at runtime by powerBegin(). DFS_INIT_AUTO only decides what
+# the device does between startup and that call.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
 # app_main builds the data model, and the WiFi/IP events CHIP subscribes to run
 # on the system event task; both overflow the stock stacks.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
