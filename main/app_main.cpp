@@ -18,6 +18,7 @@
 #include "internals.h"
 #include "keys.h"
 #include "net.h"
+#include "netconsole.h"
 #include "panel.h"
 #include "power.h"
 #include "qrcode.h"
@@ -529,6 +530,8 @@ extern "C" void app_main(void) {
   // After esp_matter::start(): the WiFi driver has to exist before its
   // power-save mode can be set.
   powerBegin();
+  // Last of the console registrations, so a TCP session finds every command.
+  netconsoleBegin();
 
   s_showQr = !bridgeCommissioned();
   if (s_showQr) {

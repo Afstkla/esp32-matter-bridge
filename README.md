@@ -172,9 +172,43 @@ port at a time.
 | `ps none\|min\|max` | set WiFi power save mode |
 | `battlog` | dump the battery drain log, oldest first |
 | `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |
+| `passwd <secret>\|clear` | set or remove the remote console secret (see below) — USB only |
 
 `listen N` and `sleep N` in `mctl.py` are client-side helpers for scripting a
 session, not device commands.
+
+## Remote console
+
+The USB console dies exactly when the interesting data exists — on battery,
+light-sleeping, with `battlog` filling up. The same commands are therefore
+reachable over TCP on port 5323, behind a shared secret set over USB:
+
+```
+genie> passwd correct-horse-battery
+PASSWD set, console on port 5323
+```
+
+```sh
+python tools/genie-console.py <device-ip>     # $GENIE_SECRET skips the prompt
+```
+
+`wifi` prints the address to aim at. `passwd` is USB-only: a session that only
+exists because of the current secret cannot change it. `passwd clear` removes
+the secret and stops the listener within a second, and with no secret stored
+nothing is bound at all. One session at a time — a second caller is told `BUSY`
+and hung up on — and a session idle for ten minutes is dropped.
+
+The device answers a new connection with `CHALLENGE <32 hex>`; the client
+replies with the hex HMAC-SHA256 of that nonce keyed by the secret, compared in
+constant time, three answers per connection with three seconds between them.
+The secret itself never crosses the wire — but everything after the handshake
+does, in the clear, with no integrity check on the session: this is a
+home-LAN debugging tool, not something to put in front of the internet.
+
+While a session is up the log stream is teed to it, so a `DIAG` line or a
+driver warning appears in the client as it happens. The tee runs on whichever
+task logged, so it never blocks: a socket that will not take the bytes loses
+log lines instead, and the count is reported on disconnect.
 
 ## Verifying the screen without eyes
 
