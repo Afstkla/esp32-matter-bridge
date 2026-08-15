@@ -54,6 +54,22 @@ static uint16_t s_head = 0;
 static esp_pm_lock_handle_t s_awakeOnUsb = nullptr;
 static bool s_awakeHeld = false;
 
+// Bench instrument, never persisted and off at boot: on USB the PMU reports
+// VBUS, the usb lock is held, and the chip never so much as attempts a light
+// sleep — so the one state worth measuring is the one a cable makes
+// unobservable. With this on the device behaves as if it were on battery.
+static bool s_pretendBattery = false;
+
+static void holdAwake(bool want) {
+  if (s_awakeOnUsb == nullptr || want == s_awakeHeld) {
+    return;
+  }
+  esp_err_t err = want ? esp_pm_lock_acquire(s_awakeOnUsb) : esp_pm_lock_release(s_awakeOnUsb);
+  if (err == ESP_OK) {
+    s_awakeHeld = want;
+  }
+}
+
 static uint32_t nowMs() {
   return (uint32_t)(esp_timer_get_time() / 1000);
 }
@@ -110,10 +126,11 @@ static void report() {
   esp_pm_get_configuration(&pm);
   wifi_mode_t mode = WIFI_MODE_NULL;
   esp_wifi_get_mode(&mode);
-  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d wifi_ps=%s wifi_mode=%s flush=%.1fms "
-         "underflows=%u\n",
+  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d usbsim=%d wifi_ps=%s wifi_mode=%s "
+         "flush=%.1fms underflows=%u\n",
          pm.min_freq_mhz, pm.max_freq_mhz, pm.light_sleep_enable ? 1 : 0, s_awakeHeld ? 1 : 0,
-         psName(ps), modeName(mode), panelLastFlushUs() / 1000.0, (unsigned)panelUnderflows());
+         s_pretendBattery ? 1 : 0, psName(ps), modeName(mode), panelLastFlushUs() / 1000.0,
+         (unsigned)panelUnderflows());
   pmuReport();
 }
 
@@ -147,10 +164,28 @@ static int cmdPower(int argc, char **argv) {
     report();
     return 0;
   }
+  if (strcasecmp(argv[1], "usbsim") == 0) {
+    if (argc != 3 || (strcasecmp(argv[2], "on") != 0 && strcasecmp(argv[2], "off") != 0)) {
+      printf("ERR usage: power usbsim <on|off>\n");
+      return 1;
+    }
+    s_pretendBattery = strcasecmp(argv[2], "on") == 0;
+    holdAwake(!s_pretendBattery && pmuStatus().onUsb);
+    report();
+    return 0;
+  }
+
   const char *arg = argc == 2 ? argv[1] : "";
   long fixed = strtol(arg, nullptr, 10);
   if (strcasecmp(arg, "locks") == 0) {
     return esp_pm_dump_locks(stdout) == ESP_OK ? 0 : 1;
+  }
+  if (strcasecmp(arg, "timers") == 0) {
+    return esp_timer_dump(stdout) == ESP_OK ? 0 : 1;
+  }
+  if (strcasecmp(arg, "rails") == 0) {
+    pmuDumpRails();
+    return 0;
   }
   if (strcasecmp(arg, "on") == 0) {
     configure(MAX_MHZ, MIN_MHZ, true);
@@ -159,7 +194,7 @@ static int cmdPower(int argc, char **argv) {
   } else if (fixed == 80 || fixed == 160 || fixed == 240) {
     configure((int)fixed, (int)fixed, false);
   } else {
-    printf("ERR usage: power [locks|on|off|80|160|240]\n");
+    printf("ERR usage: power [locks|timers|rails|on|off|80|160|240|usbsim <on|off>]\n");
     return 1;
   }
   report();
@@ -189,9 +224,7 @@ void powerBegin() {
   // says "no VBUS" ever lets the device sleep.
   ESP_ERROR_CHECK_WITHOUT_ABORT(
       esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb", &s_awakeOnUsb));
-  if (s_awakeOnUsb != nullptr && esp_pm_lock_acquire(s_awakeOnUsb) == ESP_OK) {
-    s_awakeHeld = true;
-  }
+  holdAwake(true);
 
   dropStaleSoftAp();
 
@@ -209,8 +242,10 @@ void powerBegin() {
   }
 
   consoleRegisterCmd("power",
-                     "Show power state; 'locks' dumps PM locks, 'on' restores DFS and light "
-                     "sleep, 'off'|'80'|'160'|'240' pin the clock instead",
+                     "Show power state; 'locks' dumps PM locks and sleep stats, 'timers' dumps "
+                     "esp_timer, 'rails' the PMU regulators, 'on' restores DFS and light sleep, "
+                     "'off'|'80'|'160'|'240' pin the clock instead, 'usbsim on|off' fakes the "
+                     "cable being out (debug)",
                      cmdPower);
   consoleRegisterCmd("ps", "Set WiFi power save: none | min | max", cmdPs);
   consoleRegisterCmd("battlog", "Dump the battery drain log, oldest first", cmdBattlog);
@@ -234,13 +269,7 @@ void powerPoll() {
     return;
   }
 
-  if (s_awakeOnUsb != nullptr && pmu.onUsb != s_awakeHeld) {
-    esp_err_t err =
-        pmu.onUsb ? esp_pm_lock_acquire(s_awakeOnUsb) : esp_pm_lock_release(s_awakeOnUsb);
-    if (err == ESP_OK) {
-      s_awakeHeld = pmu.onUsb;
-    }
-  }
+  holdAwake(pmu.onUsb && !s_pretendBattery);
 
   static uint32_t lastAt = 0;
   static bool firstSample = true;

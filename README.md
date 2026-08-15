@@ -168,7 +168,7 @@ port at a time.
 | `decommission` | erase all fabrics and restart |
 | `touchdump <ms>` | stream touch register changes |
 | `screendump` | stream the framebuffer as base64 (see below) |
-| `power [locks\|on\|off\|80\|160\|240]` | power management tuning — **debug surface** |
+| `power [locks\|timers\|rails\|on\|off\|80\|160\|240\|usbsim on\|off]` | power management tuning and drain instrumentation — **debug surface** |
 | `ps none\|min\|max` | set WiFi power save mode |
 | `battlog` | dump the battery drain log, oldest first |
 | `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |
@@ -300,6 +300,30 @@ time and PMU reading; `power locks` dumps the PM lock table; `power
 80|160|240` pins the clock for testing and `power off` disables light sleep
 entirely, falling back to the fixed 240 MHz clock — the escape hatch if the
 panel path ever misbehaves under DFS again.
+
+### Measuring the drain
+
+`CONFIG_PM_PROFILING` and `CONFIG_ESP_TIMER_PROFILING` are on, which turns
+three commands into the whole instrument for a drain investigation:
+
+- `power locks` — per-lock hold time and share of wall clock, time in each
+  DFS mode, and `light_sleep_counts` / `light_sleep_reject_counts`. There are
+  no reset controls: take two dumps and subtract, or the boot burst dominates
+  everything.
+- `power timers` — `esp_timer_dump`, with per-timer armed/triggered counts and
+  total callback time. Most rows are CHIP's, all named `ETSTimer`; the counts
+  still say which one is firing.
+- `power rails` — every AXP2101 regulator, on or off, with its voltage. The
+  firmware programs no regulator, so this is the PMU's power-on default, and a
+  rail with nothing on it is still a rail that is on.
+
+`power usbsim on` is the bench override, and it is **debug only**: it releases
+the VBUS-gated `NO_LIGHT_SLEEP` lock even though the cable is in, so idle
+behaviour on battery becomes observable while plugged in. USB-CDC stutters or
+dies while it is on — that is the light sleep working, not a fault — so drive
+it from the remote console, which survives. It never persists and is off at
+every boot; `power usbsim off` (or a reboot) hands the lock back to VBUS.
+`power` reports `usbsim=`.
 
 ## Genie's own internals
 

@@ -51,6 +51,14 @@ CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
 
+# Without these, `power locks` can only say which locks exist, not what they
+# cost: profiling adds per-lock held time, time in each DFS mode, the
+# light-sleep taken/rejected counters, and per-timer trigger counts. That is
+# the whole measurement for the drain hunt, so it stays on until the drain is
+# understood.
+CONFIG_PM_PROFILING=y
+CONFIG_ESP_TIMER_PROFILING=y
+
 # app_main builds the data model, and the WiFi/IP events CHIP subscribes to run
 # on the system event task; both overflow the stock stacks.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

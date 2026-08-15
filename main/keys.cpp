@@ -193,6 +193,55 @@ void pmuReport() {
          vbusMv, sysMv, pct, vbusIn ? 1 : 0, charging ? 1 : 0, tempC);
 }
 
+// Enable bits live in three registers; the DCDCs share 0x80, the LDOs 0x90 and
+// (DLDO2 alone) 0x91. The voltage byte is printed raw for the buck converters,
+// whose scales differ per rail, and decoded for the LDO group, which is one
+// uniform 0.5 V + 100 mV/step ladder.
+void pmuDumpRails() {
+  if (!s_pmuReady) {
+    printf("PMU absent\n");
+    return;
+  }
+  static const struct {
+    const char *name;
+    uint8_t enableReg;
+    uint8_t enableBit;
+    uint8_t voltReg;
+    bool ldoLadder;
+  } RAILS[] = {
+      {"DCDC1", 0x80, 0, 0x82, false},  {"DCDC2", 0x80, 1, 0x83, false},
+      {"DCDC3", 0x80, 2, 0x84, false},  {"DCDC4", 0x80, 3, 0x85, false},
+      {"DCDC5", 0x80, 4, 0x86, false},  {"ALDO1", 0x90, 0, 0x92, true},
+      {"ALDO2", 0x90, 1, 0x93, true},   {"ALDO3", 0x90, 2, 0x94, true},
+      {"ALDO4", 0x90, 3, 0x95, true},   {"BLDO1", 0x90, 4, 0x96, true},
+      {"BLDO2", 0x90, 5, 0x97, true},   {"CPUSLDO", 0x90, 6, 0x98, false},
+      {"DLDO1", 0x90, 7, 0x99, true},   {"DLDO2", 0x91, 0, 0x9A, false},
+  };
+
+  resetPmuFault();
+  uint8_t dcdcEnable = pmuReadReg(0x80);
+  uint8_t ldoEnable0 = pmuReadReg(0x90);
+  uint8_t ldoEnable1 = pmuReadReg(0x91);
+  printf("RAILS dcdc_en=0x%02X ldo_en0=0x%02X ldo_en1=0x%02X\n", dcdcEnable, ldoEnable0,
+         ldoEnable1);
+  for (const auto &rail : RAILS) {
+    uint8_t enables = rail.enableReg == 0x80   ? dcdcEnable
+                      : rail.enableReg == 0x90 ? ldoEnable0
+                                               : ldoEnable1;
+    bool on = (enables >> rail.enableBit) & 1;
+    uint8_t volt = pmuReadReg(rail.voltReg);
+    if (rail.ldoLadder) {
+      printf("RAIL %-7s %s %umV (0x%02X)\n", rail.name, on ? "on " : "off",
+             500 + 100 * (volt & 0x1F), volt);
+    } else {
+      printf("RAIL %-7s %s raw 0x%02X\n", rail.name, on ? "on " : "off", volt);
+    }
+  }
+  if (s_pmuFault) {
+    printf("RAILS incomplete: a register read failed\n");
+  }
+}
+
 // Two callers on the ui task want this on two different schedules — the drain
 // log every ten minutes, the Matter sensors every thirty seconds, the light
 // sleep decision every tick. One cached burst serves all of them: the AXP2101's
