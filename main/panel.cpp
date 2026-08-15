@@ -3,7 +3,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <unistd.h>
 
 #include "driver/spi_master.h"
@@ -55,7 +54,6 @@ static i2c_master_dev_handle_t s_touch = nullptr;
 static uint16_t *s_frame = nullptr;
 static bool s_asleep = false;
 static SemaphoreHandle_t s_flushDone = nullptr;
-static std::mutex s_flushLock;
 
 // EXIO0 = LCD_RESET, EXIO1 = TP_RESET, EXIO2 = DSI_PWR_EN. Neither reset line
 // reaches a GPIO on this board, so the panel driver is created without a reset
@@ -108,6 +106,15 @@ static void displayInit() {
 
   esp_lcd_panel_io_spi_config_t io = CO5300_PANEL_IO_QSPI_CONFIG(PIN_LCD_CS, onFlushDone, nullptr);
   io.pclk_hz = LCD_CLOCK_HZ;
+  // A frame is 329 728 bytes and the ESP32-S3's DMA caps one transaction at
+  // 32 768, so esp_lcd splits it into eleven chunks. The macro's depth of ten
+  // sizes both the descriptor pool and the driver's return queue, which leaves
+  // every single frame recycling a descriptor mid-transfer with the return
+  // queue at exactly zero headroom — and spi_master's ISR discards the result
+  // of the xQueueSendFromISR that hands a finished descriptor back. One
+  // dropped descriptor is a drain that waits forever. Twelve fits the whole
+  // frame with a slot to spare.
+  io.trans_queue_depth = 12;
   io.flags.psram_dma_direct = 1;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io, &s_io));
 
@@ -186,6 +193,13 @@ void panelWake() {
   s_asleep = false;
 }
 
+// The ui task is the only task that may be inside this, panelSleep(),
+// panelWake(), panelBrightness() or any gfx call. esp_lcd's panel IO handle is
+// shared by draw_bitmap and tx_param and is not thread safe, so a second task
+// issuing a brightness command mid-frame corrupts the transfer bookkeeping.
+// Console commands that want the panel leave their intent for the ui tick; see
+// pollRequests() in app_main.cpp.
+//
 // One draw_bitmap for the whole frame: esp_lcd chunks it internally but keeps
 // CS asserted across the chunks, and the CO5300 leaves the panel black if a
 // frame arrives as separately addressed writes. Nothing byte-swaps on the way —
@@ -195,11 +209,6 @@ void panelWake() {
 // still reading the framebuffer when it returns, and the caller's next draw
 // would race it. The timeout is a backstop so the ui task cannot hang.
 void panelFlush() {
-  // The ui task owns the framebuffer, but the console's diagnostic commands
-  // flush from their own task. Two overlapping transfers would leave the
-  // done-semaphore counting frames that are not the ones being waited on, so
-  // the bus is serialised here rather than at every caller.
-  std::lock_guard<std::mutex> held(s_flushLock);
   // A flush that timed out still gets its callback eventually. Clearing that
   // stale give here is what stops the wait below from being satisfied by the
   // previous frame, which would put every flush from then on one frame out of
@@ -212,12 +221,18 @@ void panelFlush() {
   if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
     ESP_LOGE(TAG, "flush did not complete");
   }
-  // The completion callback fires from the SPI ISR, but esp_lcd only retires
-  // the finished transaction at the top of the *next* transfer, and re-entering
-  // before it has done so blocks there for good. Measured: a swipe's four
-  // back-to-back frames wedged the ui task on the second one, every time. One
-  // tick of headroom costs 1 ms against a 17 ms flush and protects every caller
-  // rather than only the animation that happened to find it.
+  // Measured, not reasoned: the ui task must not re-enter draw_bitmap the
+  // instant the completion callback fires, or the recycle loop at the top of
+  // the next transfer waits for a descriptor that never arrives. A swipe is
+  // four full frames back to back and it is the only caller that ever gets
+  // close — it wedged on the second frame every time without this.
+  //
+  // What is bracketed: no yield wedges on frame two, taskYIELD() only pushes it
+  // out to around frame twenty-four, one tick of real time survives 160 frames.
+  // So it is elapsed time the driver needs, not a reschedule. The exact
+  // interaction inside spi_master is not pinned down; 1 ms against a 17.2 ms
+  // flush is a cheap price for not chasing it further. Double buffer before
+  // reaching for anything smoother.
   vTaskDelay(1);
 }
 
@@ -266,11 +281,14 @@ static int cmdTouchdump(int argc, char **argv) {
 // The framebuffer is the whole screen state, so streaming it out makes what the
 // panel shows machine-checkable: tools/screenshot.py turns this into a PNG.
 //
-// ponytail: reads the framebuffer from the console task without locking the ui
-// task out of it. A dump takes seconds, so holding a lock that long would trip
-// the ui task's watchdog; the cost is a torn picture if the screen changes
-// mid-dump, which the tool's length check catches and retries. Give the dump
-// its own frame copy if that ever stops being true.
+// ponytail: the one thing outside the ui task that touches the framebuffer,
+// and it only reads. A dump takes seconds, so locking the ui task out for its
+// duration would trip that task's watchdog. What makes it safe is that screens
+// are static by design — the ui task redraws only behind builderNeedsRedraw()
+// or a state change, and the single animation is over in 150 ms — so a dump
+// almost always spans a still frame. A tear would be full-length and so
+// invisible to screenshot.py's length check, which catches truncation only.
+// Dump from a frame copy if a screen ever animates continuously.
 static int cmdScreendump(int argc, char **argv) {
   const size_t chunk = 768;
   static char line[4 * (chunk / 3) + 2];

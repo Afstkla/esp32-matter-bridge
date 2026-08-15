@@ -54,9 +54,13 @@ struct CommissioningStage {
   uint8_t fabrics;
 };
 
-// The snapshot bridgeCommissioned() and bridgePairingWindowOpen() answer from.
-// Written by the CHIP task, read by the ui task on every redraw.
+// What bridgeCommissioned() and bridgePairingWindowOpen() answer from: written
+// by the CHIP task, read by the ui task on every redraw, so volatile like every
+// other flag this firmware passes between tasks. s_stage itself never leaves
+// the CHIP task — it is only the baseline the event callback diffs against.
 static CommissioningStage s_stage{};
+static volatile bool s_commissioned = false;
+static volatile bool s_windowOpen = false;
 
 static CommissioningStage readStage() {
   CommissioningStage s{};
@@ -87,6 +91,8 @@ static void eventCb(const ChipDeviceEvent *event, intptr_t arg) {
     return;
   }
   s_stage = now;
+  s_commissioned = now.fabrics > 0;
+  s_windowOpen = now.windowOpen;
   printStage(now);
 }
 
@@ -119,27 +125,30 @@ static const uint32_t PAIRING_WINDOW_SECONDS = 180;
 // A device that already holds a fabric advertises nothing — no commissioning
 // window, no BLE — so its pairing code is unusable unless something asks for a
 // window first.
-void bridgeOpenPairingWindow() {
-  CHIP_ERROR err = CHIP_NO_ERROR;
-  {
-    StackLock lock;
-    auto &manager = chip::Server::GetInstance().GetCommissioningWindowManager();
-    if (manager.IsCommissioningWindowOpen()) {
-      return;
-    }
-    err =
-        manager.OpenBasicCommissioningWindow(chip::System::Clock::Seconds32(PAIRING_WINDOW_SECONDS));
+static void openPairingWindowOnStack(intptr_t) {
+  auto &manager = chip::Server::GetInstance().GetCommissioningWindowManager();
+  if (manager.IsCommissioningWindowOpen()) {
+    return;
   }
-  s_stage.windowOpen = err == CHIP_NO_ERROR;
+  CHIP_ERROR err =
+      manager.OpenBasicCommissioningWindow(chip::System::Clock::Seconds32(PAIRING_WINDOW_SECONDS));
+  s_windowOpen = err == CHIP_NO_ERROR;
   printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
 }
 
+// Handed to the CHIP task, which already holds the stack lock, rather than
+// taking it here: the ui task opens a window from a corner tap and
+// LockChipStack has no timeout.
+void bridgeOpenPairingWindow() {
+  chip::DeviceLayer::PlatformMgr().ScheduleWork(openPairingWindowOnStack, 0);
+}
+
 bool bridgePairingWindowOpen() {
-  return s_stage.windowOpen;
+  return s_windowOpen;
 }
 
 bool bridgeCommissioned() {
-  return s_stage.fabrics > 0;
+  return s_commissioned;
 }
 
 // The raw "MT:..." payload, which is what Apple Home scans. The URL wrapper the
@@ -230,6 +239,8 @@ bool bridgeStart() {
     StackLock lock;
     s_stage = readStage();
   }
+  s_commissioned = s_stage.fabrics > 0;
+  s_windowOpen = s_stage.windowOpen;
   printStage(s_stage);
 
   consoleRegisterCmd("diag", "Show commissioning stage, network and heap", cmdDiag);
