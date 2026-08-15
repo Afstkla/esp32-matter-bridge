@@ -277,11 +277,17 @@ and beacons forever, pinning the `wifi` `APB_FREQ_MAX` lock and blocking both
 modem and light sleep. `power` reports `wifi_mode=`; anything but `sta` is that
 bug returning.
 
+Latency to the device is now DTIM-paced — 85–595 ms round-trip, against a few
+ms when the radio never slept. That is the new normal and what modem sleep
+costs; `ps min` is the runtime escape hatch if it ever grates.
+
 Battery percent is interpolated from a resting LiPo OCV table, not from the
 AXP2101's fuel gauge, which has no battery model programmed and reported 52% at
-3.58 V on a cell that died half an hour later. Voltage sags under load, so the
-estimate reads low while the device is busy and the raw `mV` stays the number
-to trust.
+3.58 V on a cell that died half an hour later. The table is only honest at
+rest. Under load the pack sags and the estimate reads low; **on USB the cell
+sits at charge voltage and it reads high** — a cell at 60% shows ~100% while
+charging. Raw `mV` stays the number to trust, and only `battlog` rows without
+the `usb`/`chg` flags are state of charge.
 
 Drain is measured with `battlog`: a 144-entry ring in NVS, sampled every 10
 minutes (`mv`/`pct`/`flags` with USB/charging/boot bits), giving a rolling

@@ -118,9 +118,10 @@ static float pmuTempC() {
 // The AXP2101's own fuel gauge has no battery model programmed — battlog has it
 // reporting 52% at 3.58 V on a cell that died half an hour later, and 50% at
 // 4.19 V — so percent is derived from voltage instead. Resting-OCV curve for a
-// single LiPo cell:
-// under load the pack sags and this reads low, which is the safe direction to
-// be wrong in, and the error shrinks as the device spends more time asleep.
+// single LiPo cell, which is only true at rest: under load the pack sags and
+// this reads low, and on USB the cell sits at charge voltage, so it reads high
+// — a cell at 60% shows ~100% while charging. Only unflagged battlog rows are
+// state of charge; usb/chg rows are the charger's voltage, not the cell's.
 static int percentFromMv(uint16_t mv) {
   static const struct {
     uint16_t mv;
@@ -214,14 +215,13 @@ PmuStatus pmuStatus() {
   readAt = now;
   resetPmuFault();
   uint16_t battMv = pmuBattMv();
-  int percent = battMv == 0 ? 0 : percentFromMv(battMv);
   float tempC = pmuTempC();
   bool charging = pmuCharging();
   bool onUsb = pmuVbusIn();
   if (!s_pmuFault) {
     s.present = true;
     s.millivolts = battMv;
-    s.percent = (uint8_t)(percent < 0 ? 0 : percent > 100 ? 100 : percent);
+    s.percent = (uint8_t)(battMv == 0 ? 0 : percentFromMv(battMv));
     s.celsius = tempC;
     s.charging = charging;
     s.onUsb = onUsb;

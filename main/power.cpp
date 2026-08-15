@@ -28,7 +28,9 @@ static const int MAX_MHZ = 240;
 static const int MIN_MHZ = 80;
 
 // A day of samples. The AXP2101 has no current ADC, so drain rate has to be
-// read off voltage and fuel-gauge percent over time.
+// read off the voltage slope over time. `pct` is interpolated from that same
+// voltage, so it is a readability aid, not a second measurement — and it is
+// only state of charge on rows without the usb/chg flags.
 static const uint32_t SAMPLE_INTERVAL_MS = 10UL * 60 * 1000;
 static const uint16_t LOG_ENTRIES = 144;
 
