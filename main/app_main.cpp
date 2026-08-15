@@ -293,10 +293,13 @@ static void pollState() {
 
 // A dark screen is the device's normal state, and there is nothing to look at
 // between ticks: dropping to four passes a second is what lets tickless idle
-// find a sleep worth taking. The cost is touch — a tap shorter than a tick can
-// fall between two polls, so waking the screen sometimes takes a second tap.
-// The CST816's INT reaches GPIO21 (active low, 10K pull-up) and would turn that
-// poll into an interrupt; wiring it up is its own job.
+// find a sleep worth taking. The cost is anything shorter than a tick: a quick
+// tap, or a quick BOOT press, can fall between two polls, so waking the screen
+// sometimes takes a second try. The power key is exempt — its PMU interrupt
+// latches, so a press waits for whenever the poll gets there.
+//
+// The CST816's INT reaches GPIO21 (active low, 10K pull-up) and would turn the
+// touch half of that into an interrupt; wiring it up is its own job.
 static const uint32_t TICK_AWAKE_MS = 20;
 static const uint32_t TICK_ASLEEP_MS = 250;
 

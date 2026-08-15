@@ -1,6 +1,7 @@
 #include "power.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <strings.h>
 
@@ -101,10 +102,10 @@ static void dumpLog() {
   }
 }
 
-// A knob rather than a constant because the panel's flush path wedges under
-// repeated full-frame redraws — rarely without power management, readily with
-// it — so being able to pin the clock or take light sleep away at runtime is
-// what makes the two comparable, and what makes the device usable meanwhile.
+// Debug surface, kept on purpose. Pinning the clock or dropping light sleep at
+// runtime is what made the flush wedge measurable — one binary, one variable at
+// a time — and it is the escape hatch if that path misbehaves again. Delete it
+// once the shelf-drain numbers are in and this configuration is settled.
 static void configure(int maxMhz, int minMhz, bool lightSleep) {
   esp_pm_config_t pm = {
       .max_freq_mhz = maxMhz,
@@ -115,16 +116,24 @@ static void configure(int maxMhz, int minMhz, bool lightSleep) {
 }
 
 static int cmdPower(int argc, char **argv) {
-  if (argc == 2 && strcasecmp(argv[1], "locks") == 0) {
+  if (argc == 1) {
+    report();
+    return 0;
+  }
+  const char *arg = argc == 2 ? argv[1] : "";
+  long fixed = strtol(arg, nullptr, 10);
+  if (strcasecmp(arg, "locks") == 0) {
     return esp_pm_dump_locks(stdout) == ESP_OK ? 0 : 1;
   }
-  if (argc == 2 && strcasecmp(argv[1], "on") == 0) {
+  if (strcasecmp(arg, "on") == 0) {
     configure(MAX_MHZ, MIN_MHZ, true);
-  } else if (argc == 2) {
-    int fixed = (int)strtol(argv[1], nullptr, 10);
-    if (fixed == 80 || fixed == 160 || fixed == 240) {
-      configure(fixed, fixed, false);
-    }
+  } else if (strcasecmp(arg, "off") == 0) {
+    configure(MAX_MHZ, MAX_MHZ, false);
+  } else if (fixed == 80 || fixed == 160 || fixed == 240) {
+    configure((int)fixed, (int)fixed, false);
+  } else {
+    printf("ERR usage: power [locks|on|off|80|160|240]\n");
+    return 1;
   }
   report();
   return 0;
@@ -170,8 +179,9 @@ void powerBegin() {
     s_head %= LOG_ENTRIES;
   }
 
-  consoleRegisterCmd("power", "Show power state; 'power locks' dumps PM locks, 'power on|off' "
-                              "restores it, 'power 80|160|240' pins the clock",
+  consoleRegisterCmd("power",
+                     "Show power state; 'locks' dumps PM locks, 'on' restores DFS and light "
+                     "sleep, 'off'|'80'|'160'|'240' pin the clock instead",
                      cmdPower);
   consoleRegisterCmd("ps", "Set WiFi power save: none | min | max", cmdPs);
   consoleRegisterCmd("battlog", "Dump the battery drain log, oldest first", cmdBattlog);

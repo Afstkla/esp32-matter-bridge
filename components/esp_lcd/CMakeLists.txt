@@ -1,3 +1,11 @@
+# This is a copy of one IDF version's esp_lcd, not a fork that tracks upstream.
+# On any other version it silently shadows the real component with older code.
+if(NOT "${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}.${IDF_VERSION_PATCH}" STREQUAL "5.5.5")
+    message(WARNING "components/esp_lcd is a patched copy of ESP-IDF 5.5.5, but this is IDF "
+                    "${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}.${IDF_VERSION_PATCH}. Re-copy it "
+                    "from this IDF and re-apply the change in PATCH.md, or delete the override.")
+endif()
+
 idf_build_get_property(target IDF_TARGET)
 
 if(${target} STREQUAL "linux")

@@ -30,6 +30,11 @@ static int cmdHeap(int argc, char **argv) {
 
 // Runs on the console task, so it works while another task is parked — which
 // is the whole point: it names the line a wedged task is blocked on.
+//
+// Debug surface, kept on purpose: it suspends the scheduler to walk the task
+// list, which is not something a shipping build should be able to do on a
+// typo. It stays until the panel path has gone a long stretch without a stall
+// worth pointing it at.
 static int cmdBacktrace(int argc, char **argv) {
   esp_backtrace_print_all_tasks(16);
   return 0;

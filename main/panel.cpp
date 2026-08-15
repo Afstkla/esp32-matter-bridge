@@ -56,7 +56,7 @@ static bool s_asleep = false;
 static SemaphoreHandle_t s_flushDone = nullptr;
 static uint32_t s_lastFlushUs = 0;
 
-// EXIO0 = LCD_RESET, EXIO1 = TP_RESET, EXIO2 = DSI_PWR_EN. Neither reset line
+// EXIO0 = LCD_RESET, EXIO1 = DSI_PWR_EN, EXIO2 = TP_RESET. Neither reset line
 // reaches a GPIO on this board, so the panel driver is created without a reset
 // pin and relies on this pulse having already run.
 static void releaseResets() {
