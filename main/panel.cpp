@@ -108,13 +108,10 @@ static void displayInit() {
   esp_lcd_panel_io_spi_config_t io = CO5300_PANEL_IO_QSPI_CONFIG(PIN_LCD_CS, onFlushDone, nullptr);
   io.pclk_hz = LCD_CLOCK_HZ;
   // A frame is 329 728 bytes and the ESP32-S3's DMA caps one transaction at
-  // 32 768, so esp_lcd splits it into eleven chunks. The macro's depth of ten
-  // sizes both the descriptor pool and the driver's return queue, which leaves
-  // every single frame recycling a descriptor mid-transfer with the return
-  // queue at exactly zero headroom — and spi_master's ISR discards the result
-  // of the xQueueSendFromISR that hands a finished descriptor back. One
-  // dropped descriptor is a drain that waits forever. Twelve fits the whole
-  // frame with a slot to spare.
+  // 32 768, so esp_lcd splits it into eleven chunks. Twelve descriptors fit
+  // the whole frame, so no chunk ever waits on a mid-frame recycle. (This was
+  // once believed to be the wedge fix; it is not — see the drain-accounting
+  // patch in components/esp_lcd/PATCH.md for the real mechanism.)
   io.trans_queue_depth = 12;
   io.flags.psram_dma_direct = 1;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io, &s_io));
@@ -224,18 +221,16 @@ void panelFlush() {
     ESP_LOGE(TAG, "flush did not complete");
   }
   s_lastFlushUs = (uint32_t)(esp_timer_get_time() - startedAt);
-  // Measured, not reasoned: the ui task must not re-enter draw_bitmap the
-  // instant the completion callback fires, or the recycle loop at the top of
-  // the next transfer waits for a descriptor that never arrives. A swipe is
-  // four full frames back to back and it is the only caller that ever gets
-  // close — it wedged on the second frame every time without this.
-  //
-  // What is bracketed: no yield wedges on frame two, taskYIELD() only pushes it
-  // out to around frame twenty-four, one tick of real time survives 160 frames.
-  // So it is elapsed time the driver needs, not a reschedule. The exact
-  // interaction inside spi_master is not pinned down; 1 ms against a 17.2 ms
-  // flush is a cheap price for not chasing it further. Double buffer before
-  // reaching for anything smoother.
+  // The frame DMAs straight out of PSRAM, and under enough bus contention the
+  // EDMA can fail to refill the SPI FIFO even at 40 MHz — a "DMA TX underflow",
+  // one garbled chunk on the wire. The wedge that used to follow (the next
+  // frame parking forever inside draw_bitmap) was esp_lcd losing count of a
+  // faulted-but-consumed result; that is fixed in components/esp_lcd (see its
+  // PATCH.md), so an underflow is now a one-frame glitch and a W log line.
+  // This tick of quiet between frames is what makes underflows rare in the
+  // first place: back-to-back frames keep the PSRAM bus saturated, and the
+  // earlier bracket (no yield: glitch by frame 2; taskYIELD(): ~24; one tick:
+  // 160+ clean) was measuring exactly that contention relief.
   vTaskDelay(1);
 }
 
