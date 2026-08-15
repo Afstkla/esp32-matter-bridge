@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unistd.h>
 
 #include "driver/spi_master.h"
@@ -54,6 +55,7 @@ static i2c_master_dev_handle_t s_touch = nullptr;
 static uint16_t *s_frame = nullptr;
 static bool s_asleep = false;
 static SemaphoreHandle_t s_flushDone = nullptr;
+static std::mutex s_flushLock;
 
 // EXIO0 = LCD_RESET, EXIO1 = TP_RESET, EXIO2 = DSI_PWR_EN. Neither reset line
 // reaches a GPIO on this board, so the panel driver is created without a reset
@@ -193,6 +195,11 @@ void panelWake() {
 // still reading the framebuffer when it returns, and the caller's next draw
 // would race it. The timeout is a backstop so the ui task cannot hang.
 void panelFlush() {
+  // The ui task owns the framebuffer, but the console's diagnostic commands
+  // flush from their own task. Two overlapping transfers would leave the
+  // done-semaphore counting frames that are not the ones being waited on, so
+  // the bus is serialised here rather than at every caller.
+  std::lock_guard<std::mutex> held(s_flushLock);
   // A flush that timed out still gets its callback eventually. Clearing that
   // stale give here is what stops the wait below from being satisfied by the
   // previous frame, which would put every flush from then on one frame out of

@@ -1,5 +1,6 @@
 #include "gfx.h"
 
+#include <cmath>
 #include <cstring>
 
 // font8x8_basic by Daniel Hepper, from IBM's public-domain VGA fonts — public
@@ -134,10 +135,75 @@ void gfxFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t colour) {
 }
 
 void gfxDrawRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t colour) {
+  // Callers pass computed sizes, and an empty rectangle is a legitimate answer.
+  // Without this h == 0 draws a stray row at y - 1.
+  if (w <= 0 || h <= 0) {
+    return;
+  }
   gfxFillRect(x, y, w, 1, colour);
   gfxFillRect(x, y + h - 1, w, 1, colour);
   gfxFillRect(x, y, 1, h, colour);
   gfxFillRect(x + w - 1, y, 1, h, colour);
+}
+
+// How far a row of a rounded rectangle is pulled in by the corner arc, 0 for
+// every row between the two corners.
+static int16_t cornerInset(int16_t row, int16_t h, int16_t r) {
+  int16_t dy = -1;
+  if (row < r) {
+    dy = r - 1 - row;
+  } else if (row >= h - r) {
+    dy = row - (h - r);
+  }
+  if (dy < 0) {
+    return 0;
+  }
+  return (int16_t)(r - (int16_t)(sqrtf((float)(r * r - dy * dy)) + 0.5f));
+}
+
+static int16_t roundRadius(int16_t w, int16_t h, int16_t r) {
+  int16_t limit = (w < h ? w : h) / 2;
+  return r > limit ? limit : r;
+}
+
+void gfxFillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t colour) {
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  r = roundRadius(w, h, r);
+  for (int16_t row = 0; row < h; row++) {
+    int16_t inset = cornerInset(row, h, r);
+    gfxFillRect(x + inset, y + row, w - 2 * inset, 1, colour);
+  }
+}
+
+void gfxDrawRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t colour) {
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  r = roundRadius(w, h, r);
+  int16_t previous = 0;
+  for (int16_t row = 0; row < h; row++) {
+    int16_t inset = cornerInset(row, h, r);
+    if (row == 0 || row == h - 1) {
+      gfxFillRect(x + inset, y + row, w - 2 * inset, 1, colour);
+    } else {
+      // The inset can fall by more than a pixel per row, so each side is drawn
+      // as a run back to where the row above stopped; a single pixel would
+      // leave the arc dotted.
+      int16_t run = previous > inset ? (int16_t)(previous - inset + 1) : 1;
+      gfxFillRect(x + inset, y + row, run, 1, colour);
+      gfxFillRect(x + w - inset - run, y + row, run, 1, colour);
+    }
+    previous = inset;
+  }
+}
+
+void gfxFillCircle(int16_t cx, int16_t cy, int16_t r, uint16_t colour) {
+  for (int16_t dy = -r; dy <= r; dy++) {
+    int16_t dx = (int16_t)sqrtf((float)(r * r - dy * dy));
+    gfxFillRect(cx - dx, cy + dy, 2 * dx + 1, 1, colour);
+  }
 }
 
 void gfxText(int16_t x, int16_t y, const char *text, uint16_t colour, uint8_t scale) {
