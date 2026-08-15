@@ -120,7 +120,9 @@ bool bridgeBegin() {
   return true;
 }
 
-static const uint32_t PAIRING_WINDOW_SECONDS = 180;
+// The spec's maximum. 180 s proved too short for Home's add-accessory flow
+// when the commissioner starts from autodiscovery rather than the QR screen.
+static const uint32_t PAIRING_WINDOW_SECONDS = 900;
 
 // A device that already holds a fabric advertises nothing — no commissioning
 // window, no BLE — so its pairing code is unusable unless something asks for a
@@ -233,6 +235,13 @@ bool bridgeStart() {
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_matter start failed (%d)", err);
     return false;
+  }
+
+  // Without this the BLE advertisement is nameless and a commissioner's
+  // discovery list shows an anonymous "Matter Accessory" among the
+  // neighbours' devices.
+  if (chip::DeviceLayer::ConnectivityMgr().SetBLEDeviceName("Genie") != CHIP_NO_ERROR) {
+    ESP_LOGW(TAG, "BLE device name not set");
   }
 
   {
