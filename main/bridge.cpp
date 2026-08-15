@@ -143,7 +143,7 @@ static const uint32_t PAIRING_WINDOW_SECONDS = 180;
 // A device that already holds a fabric advertises nothing — no commissioning
 // window, no BLE — so its pairing code is unusable unless something asks for a
 // window first.
-static void openPairingWindow() {
+void bridgeOpenPairingWindow() {
   StackLock lock;
   auto &manager = chip::Server::GetInstance().GetCommissioningWindowManager();
   if (manager.IsCommissioningWindowOpen()) {
@@ -154,6 +154,11 @@ static void openPairingWindow() {
   printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
 }
 
+bool bridgePairingWindowOpen() {
+  StackLock lock;
+  return chip::Server::GetInstance().GetCommissioningWindowManager().IsCommissioningWindowOpen();
+}
+
 bool bridgeCommissioned() {
   StackLock lock;
   return chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
@@ -161,13 +166,13 @@ bool bridgeCommissioned() {
 
 // The raw "MT:..." payload, which is what Apple Home scans. The URL wrapper the
 // Arduino library handed out had to be cut back to this anyway.
-static bool pairingPayload(char *out, size_t size) {
+bool bridgePairingPayload(char *out, size_t size) {
   chip::MutableCharSpan span(out, size);
   return GetQRCode(span, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE)) ==
          CHIP_NO_ERROR;
 }
 
-static bool pairingCode(char *out, size_t size) {
+bool bridgePairingCode(char *out, size_t size) {
   chip::MutableCharSpan span(out, size);
   return GetManualPairingCode(
              span, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE)) ==
@@ -180,10 +185,10 @@ static void printPairing() {
   char code[chip::kManualSetupLongCodeCharLength + 2] = {0};
   char payload[chip::QRCodeBasicSetupPayloadGenerator::kMaxQRCodeBase38RepresentationLength + 1] = {
       0};
-  if (pairingCode(code, sizeof(code))) {
+  if (bridgePairingCode(code, sizeof(code))) {
     printf("CODE %s\n", code);
   }
-  if (pairingPayload(payload, sizeof(payload))) {
+  if (bridgePairingPayload(payload, sizeof(payload))) {
     printf("QR %s\n", payload);
   }
 }
@@ -213,7 +218,7 @@ static int cmdPairing(int argc, char **argv) {
 }
 
 static int cmdWindow(int argc, char **argv) {
-  openPairingWindow();
+  bridgeOpenPairingWindow();
   return 0;
 }
 
@@ -579,7 +584,9 @@ bool BridgedAccessory::setBrightness(uint8_t level) {
     return _started;
   }
   _level = level;
-  esp_matter_attr_val_t val = esp_matter_uint8(level);
+  // CurrentLevel is declared ATTRIBUTE_FLAG_NULLABLE, and attribute::update
+  // rejects a plain uint8 against it with ESP_ERR_INVALID_ARG.
+  esp_matter_attr_val_t val = esp_matter_nullable_uint8(level);
   return updateAttributeVal(LevelControl::Id, LevelControl::Attributes::CurrentLevel::Id, &val);
 }
 

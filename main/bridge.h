@@ -2,6 +2,7 @@
 
 #include <esp_matter.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 
@@ -60,6 +61,14 @@ void bridgeCount(esp_matter::endpoint_t *endpoint, uint16_t *clusters, uint16_t 
 
 // True once the device holds at least one fabric.
 bool bridgeCommissioned();
+
+// The pairing screen's material. The payload is the raw "MT:..." string Apple
+// Home scans; the code is the 11 digits underneath it.
+bool bridgePairingPayload(char *out, size_t size);
+bool bridgePairingCode(char *out, size_t size);
+
+bool bridgePairingWindowOpen();
+void bridgeOpenPairingWindow();
 
 // The Matter device types this bridge can expose, in the order the picker
 // offers them: the things you operate first, then the things that only report.
