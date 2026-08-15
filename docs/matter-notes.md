@@ -322,6 +322,30 @@ through that one function.
 The endpoint config's initial value has the same problem — the object never sees
 it — so a restored reading must be pushed once after `endpoint::enable()`.
 
+A directory under `clusters/` is not proof of a cluster object, so check what
+the integration actually registers before assuming which path a cluster is on.
+There are three:
+
+```cpp
+if (auto *cluster = mRegistry.Get(request.path); cluster != nullptr) { ... }   // 1
+TryReadViaAccessInterface(path, AttributeAccessInterfaceRegistry::Instance().Get(...), encoder);  // 2
+attribute::get_val_internal(attribute, &val);   // 3
+```
+
+**Power Source** has a directory and still lands on 3. Its integration
+registers no `ServerCluster` at all — only an `AttributeAccessInterface`, and
+that one answers `ActiveBatFaults`, `EndpointList` and `ClusterRevision` and
+nothing else. An AAI that does not encode returns `std::nullopt` and reading
+falls through, so every battery attribute is served from the store and
+`attribute::update()` is the correct write. The reverse mistake is as
+expensive as the original one: pushing into a registry object that is not
+there fails silently too.
+
+One consequence to keep in mind: `ClusterRevision` on this cluster is answered
+by the AAI from CHIP's `PowerSource::kRevision`, so the revision esp_matter
+stored is never read by anyone. They agree at 3 here, but a future submodule
+bump could part them and nothing would say so.
+
 To see what a controller would get, use `walk`: `attribute::get_val()` reads
 back through the provider, so it shows the object's value, not the store's.
 

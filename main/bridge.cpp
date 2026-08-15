@@ -413,6 +413,11 @@ bool bridgeStart() {
 // for a measurement and false for a flag. OnOff and LevelControl have no such
 // object and are served from the store, which is why the lamp worked from the
 // first day and every sensor read empty.
+//
+// Power Source is a third shape and lands in the default branch too: its
+// integration registers no cluster object at all, only an
+// AttributeAccessInterface answering ActiveBatFaults, EndpointList and
+// ClusterRevision. Everything the battery reports falls past it to the store.
 template <typename T>
 static T *serverCluster(uint16_t endpointId, uint32_t clusterId) {
   return static_cast<T *>(esp_matter::data_model::provider::get_instance().registry().Get(

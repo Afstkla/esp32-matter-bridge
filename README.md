@@ -307,8 +307,20 @@ The board reports itself as one further accessory, and it is the only one here
 that is not invented: a **composed device** — a bridged node carrying a child
 endpoint per function, whose `PartsList` is what tells a controller they are one
 thing. Apple Home draws it as a single tile. Inside are the PMU die
-temperature, the battery percentage, and the display brightness, which really
-does dim the panel.
+temperature and the display brightness, which really does dim the panel.
+
+The battery is not a child endpoint. It is a **Power Source** cluster on the
+parent itself — Bridged Node carries that cluster as an optional server, which
+is Matter's way of saying "this accessory runs on a battery". Home reads it and
+shows the level in the accessory's details, with the usual low-battery
+notification once `BatChargeLevel` leaves `Ok`; the cuts are 20% for a warning
+and 7% for critical, on the OCV-derived percent whose caveats are above.
+`BatPercentRemaining` is in half-percents, so a full cell reads 200.
+
+It used to be a **humidity** child, because Home was assumed not to read Power
+Source. It does, so that child is gone. Home drops the stale tile on its own,
+though it can take a while — reopening the accessory, or toggling it out of the
+room and back, hurries it along.
 
 Six accessories is the cap because the tile grid is six-to-a-page by design,
 not because memory demands it — see "Why ESP-IDF" above for what six actually

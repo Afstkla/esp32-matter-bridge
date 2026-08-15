@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include <app-common/zap-generated/cluster-enums.h>
 #include <esp_matter.h>
 #include <platform/CHIPDeviceLayer.h>
 
@@ -83,6 +84,16 @@ Backlight s_backlight;
 struct Ids {
   uint16_t parent;
   uint16_t temperature;
+  uint16_t backlight;
+};
+
+// What the blob looked like while the battery was a humidity child. The device
+// is commissioned and cannot be reset, so its stored blob is still this shape
+// on the first boot after the change, and the backlight id has to come out of
+// it unchanged — a backlight that renumbers is a new accessory to Home.
+struct IdsV1 {
+  uint16_t parent;
+  uint16_t temperature;
   uint16_t battery;
   uint16_t backlight;
 };
@@ -91,7 +102,7 @@ static const char *IDS_NAMESPACE = "internals";
 static const char *IDS_KEY = "eps";
 
 static endpoint_t *s_parent = nullptr;
-static Ids s_ids = {0, 0, 0, 0};
+static Ids s_ids = {0, 0, 0};
 static nvs_handle_t s_nvs = 0;
 static char s_label[33] = {0};
 static char s_serial[13] = {0};
@@ -102,9 +113,18 @@ static void persistIds() {
 }
 
 static void loadIds() {
-  size_t stored = sizeof(s_ids);
-  if (nvs_get_blob(s_nvs, IDS_KEY, &s_ids, &stored) != ESP_OK || stored != sizeof(s_ids)) {
-    s_ids = {0, 0, 0, 0};
+  s_ids = {0, 0, 0};
+  size_t stored = 0;
+  if (nvs_get_blob(s_nvs, IDS_KEY, nullptr, &stored) != ESP_OK) {
+    return;
+  }
+  if (stored == sizeof(Ids)) {
+    nvs_get_blob(s_nvs, IDS_KEY, &s_ids, &stored);
+    return;
+  }
+  IdsV1 v1 = {0, 0, 0, 0};
+  if (stored == sizeof(v1) && nvs_get_blob(s_nvs, IDS_KEY, &v1, &stored) == ESP_OK) {
+    s_ids = {v1.parent, v1.temperature, v1.backlight};
   }
 }
 
@@ -132,6 +152,56 @@ static endpoint_t *makeChild(uint16_t wanted, void *priv) {
     return nullptr;
   }
   return endpoint;
+}
+
+// BatPercentRemaining is in half-percents, so a full cell reads 200.
+static uint8_t batteryHalfPercent(uint8_t percent) {
+  return percent >= 100 ? 200 : (uint8_t)(percent * 2);
+}
+
+// Cuts on the OCV-derived percent, which reads high on USB and low under load
+// (see the battery section of the README), so they sit well clear of the knee
+// where a LiPo's voltage falls off. Anything but Ok makes Home shout, and a
+// pack that only looks empty because the panel is drawing should not do that.
+static uint8_t batteryChargeLevel(uint8_t percent) {
+  if (percent <= 7) {
+    return (uint8_t)PowerSource::BatChargeLevelEnum::kCritical;
+  }
+  if (percent <= 20) {
+    return (uint8_t)PowerSource::BatChargeLevelEnum::kWarning;
+  }
+  return (uint8_t)PowerSource::BatChargeLevelEnum::kOk;
+}
+
+// The battery lives on the parent, not on a child of its own: Bridged Node
+// carries Power Source as an optional server cluster, which is how a bridge
+// says "this accessory runs on a battery" rather than inventing an endpoint.
+//
+// The Battery feature is what makes BatChargeLevel, BatReplacementNeeded and
+// BatReplaceability mandatory; with Status, Order, Description and
+// EndpointList — all four created by cluster::power_source::create — that is
+// the cluster's complete mandatory set for this feature map, and a missing one
+// is how an accessory ends up unsupported. BatPercentRemaining is optional and
+// is the only number Home actually draws, so it is added by hand.
+static void addBattery(endpoint_t *parent, const PmuStatus &pmu) {
+  cluster::power_source::config_t config;
+  config.feature_flags = cluster::power_source::feature::battery::get_id();
+  config.status = (uint8_t)PowerSource::PowerSourceStatusEnum::kActive;
+  strlcpy(config.description, "Battery", sizeof(config.description));
+  config.features.battery.bat_charge_level = batteryChargeLevel(pmu.percent);
+  // Not UserReplaceable: the Replaceable feature would come with it and bring
+  // its own mandatory attributes describing a cell nobody is meant to swap.
+  config.features.battery.bat_replaceability =
+      (uint8_t)PowerSource::BatReplaceabilityEnum::kNotReplaceable;
+
+  cluster_t *cluster = cluster::power_source::create(parent, &config, CLUSTER_FLAG_SERVER);
+  if (cluster == nullptr) {
+    ESP_LOGE(TAG, "power source create failed");
+    return;
+  }
+  cluster::power_source::attribute::create_bat_percent_remaining(
+      cluster, nullable<uint8_t>(batteryHalfPercent(pmu.percent)), nullable<uint8_t>(0),
+      nullable<uint8_t>(200));
 }
 
 static void report(const char *what, endpoint_t *endpoint) {
@@ -198,13 +268,15 @@ void internalsBegin() {
   identity::create_vendor_name(info, VENDOR_NAME, strlen(VENDOR_NAME));
   identity::create_product_name(info, INTERNALS_NAME, strlen(INTERNALS_NAME));
   identity::create_serial_number(info, s_serial, strlen(s_serial));
+
+  PmuStatus pmu = pmuStatus();
+  addBattery(s_parent, pmu);
   if (!bridgePublish(s_parent)) {
     return;
   }
   report("parent", s_parent);
 
   s_ids.parent = endpoint::get_id(s_parent);
-  PmuStatus pmu = pmuStatus();
 
   temperature_sensor::config_t temperature;
   temperature.temperature_measurement.measured_value =
@@ -216,20 +288,6 @@ void internalsBegin() {
     child = nullptr;
   }
   s_ids.temperature = child != nullptr ? endpoint::get_id(child) : 0;
-
-  // Battery as a humidity reading is a lie, but Matter's Power Source cluster
-  // is not a device type Home draws on its own, and a percentage needs
-  // somewhere to live. Revisit if Home turns out to read Power Source.
-  humidity_sensor::config_t battery;
-  battery.relative_humidity_measurement.measured_value =
-      nullable<uint16_t>((uint16_t)(pmu.percent * 100));
-  child = makeChild(s_ids.battery, nullptr);
-  if (child != nullptr && humidity_sensor::add(child, &battery) == ESP_OK) {
-    child = addChild(child, "battery percent");
-  } else {
-    child = nullptr;
-  }
-  s_ids.battery = child != nullptr ? endpoint::get_id(child) : 0;
 
   dimmable_light::config_t backlight;
   backlight.on_off.on_off = true;
@@ -279,7 +337,8 @@ void internalsPoll() {
   publishValue(s_ids.temperature, TemperatureMeasurement::Id,
                TemperatureMeasurement::Attributes::MeasuredValue::Id,
                esp_matter_nullable_int16((int16_t)(pmu.celsius * 100)));
-  publishValue(s_ids.battery, RelativeHumidityMeasurement::Id,
-               RelativeHumidityMeasurement::Attributes::MeasuredValue::Id,
-               esp_matter_nullable_uint16((uint16_t)(pmu.percent * 100)));
+  publishValue(s_ids.parent, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id,
+               esp_matter_nullable_uint8(batteryHalfPercent(pmu.percent)));
+  publishValue(s_ids.parent, PowerSource::Id, PowerSource::Attributes::BatChargeLevel::Id,
+               esp_matter_enum8(batteryChargeLevel(pmu.percent)));
 }
