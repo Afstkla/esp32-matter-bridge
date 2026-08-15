@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,8 @@ static volatile int8_t s_swipeWanted = 0;
 static volatile bool s_qrToggleWanted = false;
 static volatile int16_t s_tapX = -1;
 static volatile int16_t s_tapY = 0;
+static volatile int16_t s_brightnessWanted = -1;
+static volatile int8_t s_sleepWanted = -1;  // 0 wake, 1 sleep
 
 static uint32_t nowMs() {
   return (uint32_t)(esp_timer_get_time() / 1000);
@@ -224,6 +227,28 @@ static void pollTouch() {
 }
 
 static void pollRequests() {
+  if (s_brightnessWanted >= 0) {
+    uint8_t level = (uint8_t)s_brightnessWanted;
+    s_brightnessWanted = -1;
+    panelBrightness(level);
+    printf("BRIGHT %u\n", level);
+  }
+  if (s_sleepWanted >= 0) {
+    bool wantsSleep = s_sleepWanted == 1;
+    s_sleepWanted = -1;
+    if (wantsSleep) {
+      panelSleep();
+      printf("SLEEP\n");
+    } else {
+      panelWake();
+      // Without this the idle timer is still expired and the next tick puts the
+      // screen straight back to sleep. The framebuffer was blanked on the way
+      // down, so waking also has to redraw.
+      noteActivity();
+      drawScreen();
+      printf("WAKE\n");
+    }
+  }
   if (s_swipeWanted != 0) {
     int8_t direction = s_swipeWanted;
     s_swipeWanted = 0;
@@ -270,7 +295,7 @@ static void pollState() {
 // than rebooting, which is the difference between a diagnosable stall and the
 // screen simply going quiet.
 static void uiTask(void *) {
-  esp_task_wdt_add(nullptr);
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_add(nullptr));
   drawScreen();
   printf("ready\n");
   while (true) {
@@ -385,6 +410,24 @@ static int cmdTap(int argc, char **argv) {
   return 0;
 }
 
+static int cmdBright(int argc, char **argv) {
+  if (!wantArgs(argc, 2, "bright <0-255>")) {
+    return 1;
+  }
+  s_brightnessWanted = (int16_t)std::clamp(strtol(argv[1], nullptr, 10), 0L, 255L);
+  return 0;
+}
+
+static int cmdSleep(int argc, char **argv) {
+  s_sleepWanted = 1;
+  return 0;
+}
+
+static int cmdWake(int argc, char **argv) {
+  s_sleepWanted = 0;
+  return 0;
+}
+
 static int cmdSlots(int argc, char **argv) {
   for (uint8_t i = 0; i < builderSlotCount(); i++) {
     if (!builderSlotUsed(i)) {
@@ -432,6 +475,9 @@ static void registerCommands() {
   consoleRegisterCmd("swipe", "Page the grid left or right", cmdSwipe);
   consoleRegisterCmd("tap", "Inject a tap at <x> <y>", cmdTap);
   consoleRegisterCmd("slots", "List the accessories in use", cmdSlots);
+  consoleRegisterCmd("bright", "Set panel brightness 0-255", cmdBright);
+  consoleRegisterCmd("sleep", "Blank the screen", cmdSleep);
+  consoleRegisterCmd("wake", "Unblank the screen and redraw", cmdWake);
   consoleRegisterCmd("qr", "Toggle the pairing screen", cmdQr);
   consoleRegisterCmd("idle", "Blank the screen after <seconds>, 0 to never", cmdIdle);
   consoleRegisterCmd("reset", "reset slots: clear the layout and restart", cmdReset);

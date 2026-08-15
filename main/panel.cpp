@@ -212,6 +212,13 @@ void panelFlush() {
   if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
     ESP_LOGE(TAG, "flush did not complete");
   }
+  // The completion callback fires from the SPI ISR, but esp_lcd only retires
+  // the finished transaction at the top of the *next* transfer, and re-entering
+  // before it has done so blocks there for good. Measured: a swipe's four
+  // back-to-back frames wedged the ui task on the second one, every time. One
+  // tick of headroom costs 1 ms against a 17 ms flush and protects every caller
+  // rather than only the animation that happened to find it.
+  vTaskDelay(1);
 }
 
 // Prints the touch registers whenever they change. The digitiser reports
@@ -251,54 +258,6 @@ bool panelTouch(int16_t *x, int16_t *y) {
   return true;
 }
 
-static int cmdPattern(int argc, char **argv) {
-  static const uint16_t bars[] = {COL_ALERT, COL_LEVEL, COL_OK,     COL_BUTTON,
-                                  COL_MUTED, COL_WELL,  COL_WHITE};
-  const int barCount = sizeof(bars) / sizeof(bars[0]);
-  const int barHeight = PANEL_H / 2 / barCount;
-
-  gfxFillScreen(COL_BG);
-  for (int i = 0; i < barCount; i++) {
-    gfxFillRect(0, i * barHeight, PANEL_W, barHeight, bars[i]);
-  }
-  gfxText(8, PANEL_H / 2 + 8, "GENIE PATTERN", COL_WHITE, 3);
-  gfxText(8, PANEL_H / 2 + 40, "368x448 rgb565 be", COL_FAINT, 2);
-  for (int inset = 0; inset < 60; inset += 10) {
-    gfxDrawRect(inset + 8, PANEL_H / 2 + 70 + inset, PANEL_W - 16 - 2 * inset,
-                PANEL_H / 2 - 78 - 2 * inset, inset % 20 == 0 ? COL_OUTLINE : COL_BUTTON);
-  }
-  gfxFillRect(0, PANEL_H - 8, PANEL_W, 8, COL_NET);
-
-  int64_t start = esp_timer_get_time();
-  panelFlush();
-  printf("PATTERN flush %lld us\n", esp_timer_get_time() - start);
-  return 0;
-}
-
-static int cmdBright(int argc, char **argv) {
-  if (argc != 2) {
-    printf("usage: bright <0-255>\n");
-    return 1;
-  }
-  int level = atoi(argv[1]);
-  uint8_t clamped = (uint8_t)(level < 0 ? 0 : level > 255 ? 255 : level);
-  panelBrightness(clamped);
-  printf("BRIGHT %d\n", clamped);
-  return 0;
-}
-
-static int cmdSleep(int argc, char **argv) {
-  panelSleep();
-  printf("SLEEP\n");
-  return 0;
-}
-
-static int cmdWake(int argc, char **argv) {
-  panelWake();
-  printf("WAKE\n");
-  return 0;
-}
-
 static int cmdTouchdump(int argc, char **argv) {
   panelTouchDump(argc == 2 ? (uint32_t)atoi(argv[1]) : 10000);
   return 0;
@@ -306,6 +265,12 @@ static int cmdTouchdump(int argc, char **argv) {
 
 // The framebuffer is the whole screen state, so streaming it out makes what the
 // panel shows machine-checkable: tools/screenshot.py turns this into a PNG.
+//
+// ponytail: reads the framebuffer from the console task without locking the ui
+// task out of it. A dump takes seconds, so holding a lock that long would trip
+// the ui task's watchdog; the cost is a torn picture if the screen changes
+// mid-dump, which the tool's length check catches and retries. Give the dump
+// its own frame copy if that ever stops being true.
 static int cmdScreendump(int argc, char **argv) {
   const size_t chunk = 768;
   static char line[4 * (chunk / 3) + 2];
@@ -330,10 +295,6 @@ static int cmdScreendump(int argc, char **argv) {
 }
 
 static void registerCommands() {
-  consoleRegisterCmd("pattern", "Draw a test pattern and flush it", cmdPattern);
-  consoleRegisterCmd("bright", "Set panel brightness 0-255", cmdBright);
-  consoleRegisterCmd("sleep", "Blank the screen", cmdSleep);
-  consoleRegisterCmd("wake", "Unblank the screen", cmdWake);
   consoleRegisterCmd("touchdump", "Stream touch register changes for <ms>", cmdTouchdump);
   consoleRegisterCmd("screendump", "Stream the framebuffer as base64", cmdScreendump);
 }
