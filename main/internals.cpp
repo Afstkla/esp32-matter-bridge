@@ -7,6 +7,7 @@
 #include <platform/CHIPDeviceLayer.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "nvs.h"
 
@@ -20,7 +21,12 @@ using namespace chip::app::Clusters;
 
 static const char *TAG = "internals";
 
-static const char *INTERNALS_NAME = "Genie";
+// Not const: the attribute helpers take a char *, and the strings Home shows as
+// the accessory's manufacturer and model live here rather than in the root
+// node's Basic Information, which only ever answers for the bridge itself.
+static char INTERNALS_NAME[] = "Genie";
+static char VENDOR_NAME[] = "Afstkla";
+static const char *UNIQUE_ID = "genie-internals";
 static const uint32_t POLL_INTERVAL_MS = 30000;
 
 // The panel is far brighter than a Matter level implies at the bottom of the
@@ -88,6 +94,7 @@ static endpoint_t *s_parent = nullptr;
 static Ids s_ids = {0, 0, 0, 0};
 static nvs_handle_t s_nvs = 0;
 static char s_label[33] = {0};
+static char s_serial[13] = {0};
 
 static void persistIds() {
   nvs_set_blob(s_nvs, IDS_KEY, &s_ids, sizeof(s_ids));
@@ -103,12 +110,24 @@ static void loadIds() {
 
 // Reclaims the id if there is one to reclaim. Same rule as bridge.cpp: resume()
 // only works once esp_matter::start() has restored its id counter from NVS.
+//
+// A bare endpoint has no Descriptor cluster: <type>::create() is what adds one,
+// and this builds the endpoint by hand so that the id can be reclaimed. Every
+// endpoint shall have a Descriptor (Matter core spec 9.5), and without it a
+// controller walking the parent's PartsList cannot read what the parts are.
 static endpoint_t *makeChild(uint16_t wanted, void *priv) {
   endpoint_t *endpoint = nullptr;
   if (wanted != 0) {
     endpoint = endpoint::resume(node::get(), ENDPOINT_FLAG_NONE, wanted, priv);
   }
-  return endpoint != nullptr ? endpoint : endpoint::create(node::get(), ENDPOINT_FLAG_NONE, priv);
+  if (endpoint == nullptr) {
+    endpoint = endpoint::create(node::get(), ENDPOINT_FLAG_NONE, priv);
+  }
+  if (endpoint != nullptr) {
+    cluster::descriptor::config_t descriptor;
+    cluster::descriptor::create(endpoint, &descriptor, CLUSTER_FLAG_SERVER);
+  }
+  return endpoint;
 }
 
 static void report(const char *what, endpoint_t *endpoint) {
@@ -121,13 +140,6 @@ static void report(const char *what, endpoint_t *endpoint) {
 // A child is a plain endpoint whose parent is the bridged node. That parentage
 // is the whole mechanism: it puts the child in the parent's PartsList, which is
 // how a controller learns the two are one accessory.
-//
-// Built as endpoint::create() plus <type>::add() rather than <type>::create(),
-// so the id can be reclaimed. That combination leaves out the Identify cluster
-// the all-in-one call brings: a child comes up with 2 clusters where the same
-// device type as a standalone accessory has 3. Calling identify::create() by
-// hand did not put it back and it is not yet understood why. Nothing here uses
-// Identify, so this is a conformance gap rather than a broken feature.
 static endpoint_t *addChild(endpoint_t *endpoint, const char *what) {
   if (endpoint == nullptr) {
     ESP_LOGE(TAG, "%s create failed", what);
@@ -150,6 +162,8 @@ void internalsBegin() {
   loadIds();
 
   bridged_node::config_t config;
+  strlcpy(config.bridged_device_basic_information.unique_id, UNIQUE_ID,
+          sizeof(config.bridged_device_basic_information.unique_id));
   if (s_ids.parent != 0) {
     s_parent =
         bridged_node::resume(node::get(), &config, ENDPOINT_FLAG_BRIDGE, s_ids.parent, nullptr);
@@ -171,6 +185,15 @@ void internalsBegin() {
                                 ATTRIBUTE_FLAG_WRITABLE,
                                 esp_matter_char_str(s_label, sizeof(s_label) - 1),
                                 sizeof(s_label) - 1);
+
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(s_serial, sizeof(s_serial), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3],
+           mac[4], mac[5]);
+  namespace identity = esp_matter::cluster::bridged_device_basic_information::attribute;
+  identity::create_vendor_name(info, VENDOR_NAME, strlen(VENDOR_NAME));
+  identity::create_product_name(info, INTERNALS_NAME, strlen(INTERNALS_NAME));
+  identity::create_serial_number(info, s_serial, strlen(s_serial));
   if (!bridgePublish(s_parent)) {
     return;
   }

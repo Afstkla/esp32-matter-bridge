@@ -1,10 +1,12 @@
 #include "bridge.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <app/server/Server.h>
 #include <platform/CHIPDeviceLayer.h>
+#include <platform/DeviceInstanceInfoProvider.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 #include <setup_payload/QRCodeSetupPayloadGenerator.h>
 
@@ -230,6 +232,52 @@ static int cmdWifi(int argc, char **argv) {
   return 0;
 }
 
+// The data model as a controller enumerates it: the provider serves exactly
+// these device types, clusters and attributes per endpoint, so a cluster that
+// is missing here is a cluster Home cannot read.
+static void walkEndpoint(endpoint_t *endpoint) {
+  printf("EP %u parent=%u types=", endpoint::get_id(endpoint),
+         endpoint::get_parent_endpoint_id(endpoint));
+  for (size_t i = 0; i < endpoint::get_device_type_count(endpoint); i++) {
+    uint32_t deviceType = 0;
+    uint8_t version = 0;
+    endpoint::get_device_type_at_index(endpoint, i, deviceType, version);
+    printf("0x%04X ", (unsigned)deviceType);
+  }
+  printf("\n");
+  for (cluster_t *c = cluster::get_first(endpoint); c != nullptr; c = cluster::get_next(c)) {
+    printf("  CL 0x%08X", (unsigned)cluster::get_id(c));
+    for (attribute_t *a = attribute::get_first(c); a != nullptr; a = attribute::get_next(a)) {
+      printf(" 0x%04X", (unsigned)attribute::get_id(a));
+      esp_matter_attr_val_t val = esp_matter_invalid(nullptr);
+      if (attribute::get_val(a, &val) == ESP_OK &&
+          val.type == ESP_MATTER_VAL_TYPE_CHAR_STRING && val.val.a.b != nullptr) {
+        printf("='%.*s'", (int)val.val.a.s, (const char *)val.val.a.b);
+      }
+    }
+    printf("\n");
+  }
+}
+
+static int cmdWalk(int argc, char **argv) {
+  char vendor[33] = {0}, product[33] = {0}, serial[33] = {0};
+  auto *info = chip::DeviceLayer::GetDeviceInstanceInfoProvider();
+  info->GetVendorName(vendor, sizeof(vendor));
+  info->GetProductName(product, sizeof(product));
+  info->GetSerialNumber(serial, sizeof(serial));
+  printf("ROOT vendor='%s' product='%s' serial='%s'\n", vendor, product, serial);
+
+  bool all = argc < 2;
+  uint16_t wanted = all ? 0 : (uint16_t)strtoul(argv[1], nullptr, 0);
+  StackLock lock;
+  for (endpoint_t *e = endpoint::get_first(node::get()); e != nullptr; e = endpoint::get_next(e)) {
+    if (all || endpoint::get_id(e) == wanted) {
+      walkEndpoint(e);
+    }
+  }
+  return 0;
+}
+
 bool bridgeStart() {
   esp_err_t err = esp_matter::start(eventCb);
   if (err != ESP_OK) {
@@ -259,6 +307,7 @@ bool bridgeStart() {
   consoleRegisterCmd("decommission", "Erase all fabrics and restart", cmdDecommission);
   consoleRegisterCmd("types", "List the accessory device types", cmdTypes);
   consoleRegisterCmd("wifi", "Show the WiFi station the stack joined", cmdWifi);
+  consoleRegisterCmd("walk", "Print the data model: walk [endpoint]", cmdWalk);
   return true;
 }
 
