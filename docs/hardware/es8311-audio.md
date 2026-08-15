@@ -46,8 +46,23 @@ amplitude-staircase burst was audible for its last 640 ms (the first two steps
 missing, later steps intact — so the loss is at the *start*, not the end); and
 enabling the amplifier 250 ms ahead of the same 200 ms burst restored the full
 210 ms of tone. `main/audio.cpp` therefore raises `PA_CTRL` `PA_SETTLE_MS`
-(200 ms) before the first sample and drops it `DMA_DRAIN_MS` (100 ms) after
-the last write returns.
+(200 ms) before the first sample.
+
+**That wait is paid once per session, not once per beep.** `PA_CTRL` stays high
+across the gaps for as long as there is beeping to do, and only goes low when
+the beeping stops — which costs the amplifier's ~4 mA quiescent draw for the
+length of a session (minutes, at most) and buys two things: the *first* beep of
+a finder session is instant rather than 200 ms late, and every later beep is a
+full-length one. Measured, mic-verified, at the beep cadence either way:
+
+| `PA_CTRL` | beep spacing | tone per burst |
+|---|---|---|
+| raised per burst | 1.92 s | 210 ms |
+| held for the session | 1.72 s | 210 ms |
+
+The amplifier still drops on `beep off` even while a `micdump` holds the
+session open, which is what keeps "no tone with the amplifier off" available as
+a control the microphone can be shown.
 
 **Polarity is active-high** (measured — the tone is only heard while GPIO46 is
 high; matches the vendor BSP's `pa_reverted = false`). This settles the
@@ -110,7 +125,8 @@ been enabled yet` in the log.
   `APB_FREQ_MAX`** PM locks (one per channel). `i2s_del_channel` deletes them:
   after `beep off`, `power locks` lists only `usb` again. Nothing lingers.
 - The DMA buffers cost about **12 KB of internal heap** for the session
-  (internal free 36.5 KB idle → 24.0 KB with the chain up).
+  (internal free 36.5 KB idle → 24.0 KB with the chain up; 35.7 KB → 23.1 KB
+  with Matter up and advertising, on an uncommissioned board).
 - ES8311 normal-operation current ~8 mA, power-down ~0 µA (datasheet). The
   codec is opened once per session, not per beep: re-running the init sequence
   every two seconds buys settle risk for nothing.

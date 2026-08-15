@@ -23,6 +23,7 @@
 #include "esp_timer.h"
 
 #include "console.h"
+#include "internals.h"
 #include "net.h"
 
 using namespace esp_matter;
@@ -47,8 +48,14 @@ static esp_err_t attributeCb(attribute::callback_type_t type, uint16_t endpoint_
   return ESP_OK;
 }
 
+// START is the plain Identify command and EFFECT is TriggerEffect; both mean
+// "make yourself findable", and the only endpoints that can are the ones the
+// composed device is made of, so internals decides whether this one is its own.
 static esp_err_t identificationCb(identification::callback_type_t type, uint16_t endpoint_id,
                                   uint8_t effect_id, uint8_t effect_variant, void *priv_data) {
+  if (type == identification::START || type == identification::EFFECT) {
+    internalsIdentify(endpoint_id);
+  }
   return ESP_OK;
 }
 

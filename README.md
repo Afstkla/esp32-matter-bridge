@@ -162,6 +162,7 @@ port at a time.
 | `bright 0-255` | set panel brightness |
 | `sleep` / `wake` | power the display module down / back up and redraw |
 | `beep [on\|off]` | beep every two seconds until told to stop, or report the state |
+| `finder [on\|off\|identify]` | start or stop a finder session the way a controller would, or fire the 5 s Identify burst |
 | `micdump <ms>` | record from the onboard microphone and stream it as base64 (see below) — **debug surface** |
 | `qr` | toggle the pairing screen |
 | `idle N` | blank the screen after N seconds, 0 to never |
@@ -397,12 +398,13 @@ The board reports itself as one further accessory, and it is the only one here
 that is not invented: a **composed device** — a bridged node carrying a child
 endpoint per function, whose `PartsList` is what tells a controller they are one
 thing. Apple Home draws it as a single tile. Inside are the PMU die
-temperature and the display brightness, which really does dim the panel.
+temperature, the display brightness — which really does dim the panel — and the
+finder, described below.
 
 The battery is not a child endpoint. It is a **Power Source** cluster on the
 parent itself, which is where the spec puts it for a composed bridged device
 powered by one cell — so the parent answers for two device types, Bridged Node
-and Power Source, and the cluster's `EndpointList` names the three endpoints
+and Power Source, and the cluster's `EndpointList` names the four endpoints
 that cell actually powers. Leaving that list empty would not have meant
 "unspecified": it means "this source powers the whole node", which on a bridge
 would have claimed the Genie's battery runs every simulated accessory too.
@@ -416,6 +418,30 @@ It used to be a **humidity** child, because Home was assumed not to read Power
 Source. It does, so that child is gone. Home drops the stale tile on its own,
 though it can take a while — reopening the accessory, or toggling it out of the
 room and back, hurries it along.
+
+### Find my Genie
+
+The third child is the **Finder**: an On/Off switch that makes the device beep
+until something stops it, for the evening the Genie is under a cushion. Turning
+it on from Home starts a 2 kHz beep every 1.7 seconds and flashes the screen if
+the screen happens to be awake; the first beep is instant, because the amplifier
+is woken once for the session rather than once per beep.
+
+It stops in four ways, and all four leave Home's tile off, because the device
+writes the switch back rather than only reacting to it:
+
+- turning it off from Home,
+- **touching the screen, or pressing PWR or BOOT** — anything you do to a
+  beeping Genie silences it, and that touch or press does nothing else,
+- **after ten minutes**, so a session nobody heard does not run the cell down,
+- five seconds after an **Identify**, which is what Home's "identify accessory"
+  button sends: a short burst rather than a whole session.
+
+A finder session asks for the screen once, when it starts. It does not hold it:
+the idle timer takes the screen back after its usual minute and the beeping
+carries on regardless, which is the right way round — audio is what finds a
+device inside a sofa, and a panel lit for ten minutes is a panel lit for ten
+minutes.
 
 Six accessories is the cap because the tile grid is six-to-a-page by design,
 not because memory demands it — see "Why ESP-IDF" above for what six actually

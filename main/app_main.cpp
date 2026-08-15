@@ -160,6 +160,14 @@ static void pollKeys() {
     return;
   }
   noteActivity();
+  // Ahead of the wake, so that one press always silences a beeping Genie —
+  // including one beeping in the dark, where waking first would cost a second
+  // press. Same rule as the tap that wakes the screen otherwise: the press that
+  // stops the finder must not also land on whatever it was pointing at.
+  if (internalsFinding()) {
+    internalsFinderStop();
+    return;
+  }
   if (panelAsleep()) {
     panelWake();
     drawScreen();
@@ -174,7 +182,12 @@ static const int16_t SWIPE_MIN_DX = 50;
 static const int16_t TAP_MAX_DRIFT = 24;
 
 static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
-  // The tap that wakes the screen must not also hit whatever was underneath it.
+  // The tap that wakes the screen must not also hit whatever was underneath it,
+  // and neither may the one that stops the finder.
+  if (internalsFinding()) {
+    internalsFinderStop();
+    return;
+  }
   if (panelAsleep()) {
     panelWake();
     drawScreen();
@@ -227,6 +240,20 @@ static void pollTouch() {
     handleRelease(downX, downY, lastX, lastY);
   }
   wasDown = down;
+}
+
+// A dark device is a hard device to find, so a finder session asks for the
+// screen once, on the edge, through the same intent flag `wake` uses. Asking
+// once rather than holding it is what keeps the finder out of the sleep state
+// machine: the idle timer takes the screen back after its usual minute and the
+// beeping carries on regardless.
+static void pollFinder() {
+  static bool wasFinding = false;
+  bool finding = internalsFinding();
+  if (finding && !wasFinding && panelAsleep()) {
+    s_sleepWanted = 0;
+  }
+  wasFinding = finding;
 }
 
 static void pollRequests() {
@@ -319,6 +346,7 @@ static void uiTask(void *) {
   printf("ready\n");
   while (true) {
     pollState();
+    pollFinder();
     pollRequests();
     internalsPoll();
     powerPoll();

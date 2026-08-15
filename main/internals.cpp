@@ -2,7 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
-
+#include <strings.h>
 #include <app-common/zap-generated/cluster-enums.h>
 #include <app/clusters/power-source-server/power-source-server.h>
 #include <esp_matter.h>
@@ -13,7 +13,9 @@
 #include "esp_timer.h"
 #include "nvs.h"
 
+#include "audio.h"
 #include "bridge.h"
+#include "console.h"
 #include "keys.h"
 #include "panel.h"
 
@@ -34,6 +36,20 @@ static const uint32_t POLL_INTERVAL_MS = 30000;
 // The panel is far brighter than a Matter level implies at the bottom of the
 // range, and zero would look like a dead device rather than a dim one.
 static const uint8_t MIN_BRIGHTNESS = 8;
+
+// Long enough to walk the house with, short enough that a session forgotten
+// under a cushion stops on its own rather than running the cell down.
+static const uint32_t FINDER_TIMEOUT_MS = 10 * 60 * 1000;
+
+// What Home's "identify accessory" button is worth: audible, and over before
+// anyone reaches for a way to stop it.
+static const uint32_t FINDER_BURST_MS = 5000;
+
+static const uint32_t FINDER_PULSE_MS = 500;
+
+static uint32_t nowMs() {
+  return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 namespace {
 
@@ -70,6 +86,13 @@ public:
     printf("internals: backlight on=%d level=%u\n", _on ? 1 : 0, level);
   }
 
+  // Asks for the level to be written again. The finder borrows the panel to
+  // flash with and this is how it gives it back, without having to know what it
+  // borrowed it from.
+  void refresh() {
+    _wanted = true;
+  }
+
 private:
   volatile bool _wanted = false;
   volatile bool _on = true;
@@ -77,6 +100,92 @@ private:
 };
 
 Backlight s_backlight;
+
+// Beeps until something stops it, so a Genie down the back of the sofa can be
+// found. Matter drives it by writing this endpoint's OnOff attribute; every
+// other way a session ends — a touch, a button, the timeout — writes that same
+// attribute back, so Home's tile is never the only thing that thinks it is on.
+//
+// attributeChanged() runs on the CHIP task and does nothing but record intent.
+// apply() is called from the ui tick, which is the only place the panel may be
+// touched and a fine place to call the audio task from.
+class Finder : public MatterEndPoint {
+public:
+  void attributeChanged(uint32_t clusterId, uint32_t attributeId,
+                        esp_matter_attr_val_t *val) override {
+    if (clusterId != OnOff::Id || attributeId != OnOff::Attributes::OnOff::Id) {
+      return;
+    }
+    _holdMs = FINDER_TIMEOUT_MS;
+    _wanted = val->val.b;
+  }
+
+  void stop() {
+    _wanted = false;
+  }
+
+  void burst() {
+    _holdMs = FINDER_BURST_MS;
+    _wanted = true;
+  }
+
+  bool finding() const {
+    return _running;
+  }
+
+  void apply() {
+    uint32_t now = nowMs();
+    if (_running && (int32_t)(now - _endsAt) >= 0) {
+      _wanted = false;
+    }
+    if (_wanted != _running) {
+      _running = _wanted;
+      _endsAt = now + _holdMs;
+      audioBeep(_running);
+      publish(_running);
+      printf("FINDER %s\n", _running ? "on" : "off");
+      if (!_running && _bright >= 0) {
+        _bright = -1;
+        s_backlight.refresh();
+      }
+    }
+    if (_running) {
+      pulse(now);
+    }
+  }
+
+  // Also the boot state: OnOff is a nonvolatile attribute, so without this a
+  // reboot mid-session would leave Home showing a tile that is on above a
+  // device that is silent.
+  void publish(bool on) {
+    esp_matter_attr_val_t val = esp_matter_bool(on);
+    bridgeUpdateValue(getEndPointId(), OnOff::Id, OnOff::Attributes::OnOff::Id, &val);
+  }
+
+private:
+  // The screen is the second half of finding the thing: a 2 kHz beep says which
+  // room, a flashing AMOLED says which cushion. Only while it is already awake
+  // — see internalsFinding() for who wakes it.
+  void pulse(uint32_t now) {
+    if (panelAsleep()) {
+      return;
+    }
+    int8_t bright = (now / FINDER_PULSE_MS) % 2 == 0 ? 1 : 0;
+    if (bright == _bright) {
+      return;
+    }
+    _bright = bright;
+    panelBrightness(bright ? 255 : MIN_BRIGHTNESS);
+  }
+
+  volatile bool _wanted = false;
+  volatile uint32_t _holdMs = FINDER_TIMEOUT_MS;
+  bool _running = false;
+  uint32_t _endsAt = 0;
+  int8_t _bright = -1;
+};
+
+Finder s_finder;
 }  // namespace
 
 // Endpoint ids are persisted for the same reason the accessories persist
@@ -86,16 +195,23 @@ struct Ids {
   uint16_t parent;
   uint16_t temperature;
   uint16_t backlight;
+  uint16_t finder;
 };
 
-// What the blob looked like while the battery was a humidity child. The device
-// is commissioned and cannot be reset, so its stored blob is still this shape
-// on the first boot after the change, and the backlight id has to come out of
-// it unchanged — a backlight that renumbers is a new accessory to Home.
-struct IdsV1 {
+// What the blob looked like before the finder. The device is commissioned and
+// cannot be reset, so its stored blob is still this shape on the first boot
+// after the change, and every id in it has to come out unchanged — a child that
+// renumbers is a new accessory to Home.
+//
+// The shape before that one (parent, temperature, battery, backlight, from when
+// the battery was a child of its own) is deliberately not handled: it is the
+// same eight bytes as the struct above, so the two cannot be told apart, and
+// reading one as the other would renumber the backlight. That shape has not
+// existed since the battery moved onto the parent — the device rewrote its blob
+// on the first boot of that firmware, long before this one.
+struct IdsV2 {
   uint16_t parent;
   uint16_t temperature;
-  uint16_t battery;
   uint16_t backlight;
 };
 
@@ -103,7 +219,7 @@ static const char *IDS_NAMESPACE = "internals";
 static const char *IDS_KEY = "eps";
 
 static endpoint_t *s_parent = nullptr;
-static Ids s_ids = {0, 0, 0};
+static Ids s_ids = {};
 static nvs_handle_t s_nvs = 0;
 static char s_label[33] = {0};
 static char s_serial[13] = {0};
@@ -114,7 +230,7 @@ static void persistIds() {
 }
 
 static void loadIds() {
-  s_ids = {0, 0, 0};
+  s_ids = {};
   size_t stored = 0;
   if (nvs_get_blob(s_nvs, IDS_KEY, nullptr, &stored) != ESP_OK) {
     return;
@@ -123,9 +239,9 @@ static void loadIds() {
     nvs_get_blob(s_nvs, IDS_KEY, &s_ids, &stored);
     return;
   }
-  IdsV1 v1 = {0, 0, 0, 0};
-  if (stored == sizeof(v1) && nvs_get_blob(s_nvs, IDS_KEY, &v1, &stored) == ESP_OK) {
-    s_ids = {v1.parent, v1.temperature, v1.backlight};
+  IdsV2 v2 = {};
+  if (stored == sizeof(v2) && nvs_get_blob(s_nvs, IDS_KEY, &v2, &stored) == ESP_OK) {
+    s_ids = {v2.parent, v2.temperature, v2.backlight, 0};
   }
 }
 
@@ -227,9 +343,9 @@ static void addBattery(endpoint_t *parent, const PmuStatus &pmu) {
 // The list is MANAGED_INTERNALLY, so attribute::update cannot reach it; the
 // AAI answers it from PowerSourceServer, which copies the span.
 static void linkBatteryEndpoints() {
-  chip::EndpointId powered[3] = {};
+  chip::EndpointId powered[4] = {};
   size_t count = 0;
-  for (uint16_t id : {s_ids.parent, s_ids.temperature, s_ids.backlight}) {
+  for (uint16_t id : {s_ids.parent, s_ids.temperature, s_ids.backlight, s_ids.finder}) {
     if (id != 0) {
       powered[count++] = id;
     }
@@ -275,6 +391,47 @@ static endpoint_t *addChild(endpoint_t *endpoint, const char *what) {
   return endpoint;
 }
 
+// on and off write the attribute rather than calling the object, so the console
+// takes the same path a controller does — callback, intent, ui tick — and the
+// round trip is testable without a commissioner.
+static int cmdFinder(int argc, char **argv) {
+  if (argc == 2 && strcasecmp(argv[1], "identify") == 0) {
+    s_finder.burst();
+  } else if (argc == 2 && strcasecmp(argv[1], "on") == 0) {
+    s_finder.publish(true);
+  } else if (argc == 2 && strcasecmp(argv[1], "off") == 0) {
+    s_finder.publish(false);
+  } else if (argc != 1) {
+    printf("ERR usage: finder [on|off|identify]\n");
+    return 1;
+  }
+  printf("FINDER endpoint=%u %s\n", s_ids.finder, s_finder.finding() ? "on" : "off");
+  return 0;
+}
+
+void internalsFinderStop() {
+  s_finder.stop();
+}
+
+bool internalsFinding() {
+  return s_finder.finding();
+}
+
+static bool isOurs(uint16_t endpointId) {
+  for (uint16_t id : {s_ids.parent, s_ids.temperature, s_ids.backlight, s_ids.finder}) {
+    if (id != 0 && id == endpointId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void internalsIdentify(uint16_t endpointId) {
+  if (isOurs(endpointId)) {
+    s_finder.burst();
+  }
+}
+
 void internalsBegin() {
   if (bridgeAggregator() == nullptr) {
     return;
@@ -317,6 +474,18 @@ void internalsBegin() {
   identity::create_product_name(info, INTERNALS_NAME, strlen(INTERNALS_NAME));
   identity::create_serial_number(info, s_serial, strlen(s_serial));
 
+  // bridged_node::add creates only the Bridged Device Basic Information
+  // cluster, so the accessory a controller sees has nowhere to send an Identify
+  // — and Identify on the endpoint carrying the name is what an ecosystem's
+  // "identify this accessory" button aims at. kAudibleBeep says what will
+  // happen: internalsIdentify() turns it into a short finder burst.
+  cluster::identify::config_t identify;
+  identify.identify_type = (uint8_t)Identify::IdentifyTypeEnum::kAudibleBeep;
+  cluster_t *identifyCluster = cluster::identify::create(s_parent, &identify, CLUSTER_FLAG_SERVER);
+  if (identifyCluster == nullptr) {
+    ESP_LOGE(TAG, "identify create failed on the parent");
+  }
+
   PmuStatus pmu = pmuStatus();
   addBattery(s_parent, pmu);
   if (!bridgePublish(s_parent)) {
@@ -352,8 +521,27 @@ void internalsBegin() {
   if (child != nullptr) {
     s_backlight.setEndPointId(s_ids.backlight);
   }
+
+  // A plug-in unit rather than a light: Home draws it as a switch you turn on
+  // and off, which is what it is, and nothing about it invites a brightness.
+  on_off_plug_in_unit::config_t finder;
+  finder.on_off.on_off = false;
+  finder.on_off_lighting.start_up_on_off = nullptr;
+  child = makeChild(s_ids.finder, (void *)&s_finder);
+  if (child != nullptr && on_off_plug_in_unit::add(child, &finder) == ESP_OK) {
+    child = addChild(child, "finder");
+  } else {
+    child = nullptr;
+  }
+  s_ids.finder = child != nullptr ? endpoint::get_id(child) : 0;
+  if (child != nullptr) {
+    s_finder.setEndPointId(s_ids.finder);
+    s_finder.publish(false);
+  }
+
   persistIds();
   linkBatteryEndpoints();
+  consoleRegisterCmd("finder", "Beep until stopped: finder [on|off|identify]", cmdFinder);
 }
 
 static void publishValue(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId,
@@ -364,16 +552,13 @@ static void publishValue(uint16_t endpointId, uint32_t clusterId, uint32_t attri
   bridgeUpdateValue(endpointId, clusterId, attributeId, &val);
 }
 
-static uint32_t nowMs() {
-  return (uint32_t)(esp_timer_get_time() / 1000);
-}
-
 void internalsPoll() {
   static uint32_t lastAt = 0;
   if (s_parent == nullptr) {
     return;
   }
   s_backlight.apply();
+  s_finder.apply();
   if (lastAt != 0 && nowMs() - lastAt < POLL_INTERVAL_MS) {
     return;
   }

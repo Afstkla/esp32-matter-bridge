@@ -47,7 +47,9 @@ static const float MIC_GAIN_DB = 0.0f;
 // Measured on this board: the amplifier passes nothing for about 175 ms after
 // its enable pin goes high, so a burst written straight after the enable is
 // heard as its last 25 ms only. Waking it this far ahead of the tone is what
-// makes the whole burst audible.
+// makes the whole burst audible — and paying it once per session rather than
+// once per burst is why the amplifier stays enabled through the gaps. It costs
+// ~4 mA for as long as the beeping lasts, which is minutes at most.
 static const uint32_t PA_SETTLE_MS = 200;
 
 // The codec is a mono part, but esp_codec_dev rejects an odd channel count, so
@@ -80,6 +82,7 @@ static TaskHandle_t s_task = nullptr;
 static volatile bool s_beepWanted = false;
 static volatile bool s_captureWanted = false;
 static volatile bool s_sessionUp = false;
+static bool s_paOn = false;
 
 static void buildTone() {
   for (size_t frame = 0; frame < CHUNK_FRAMES; frame++) {
@@ -101,13 +104,27 @@ static void releasePin(gpio_num_t pin) {
   gpio_config(&config);
 }
 
+// Rising costs the amplifier's warm-up; falling is free. The audio task is the
+// only caller, so no locking: the microphone path never touches it.
+static void amplifier(bool on) {
+  if (s_paOn == on) {
+    return;
+  }
+  s_paOn = on;
+  gpio_set_level(PIN_PA, on ? 1 : 0);
+  if (on) {
+    vTaskDelay(pdMS_TO_TICKS(PA_SETTLE_MS));
+  }
+}
+
 static bool sessionUp() {
   gpio_config_t pa = {};
   pa.pin_bit_mask = 1ULL << PIN_PA;
   pa.mode = GPIO_MODE_OUTPUT;
   gpio_config(&pa);
   // PA_CTRL is GPIO46, a strapping pin, and low is both "amplifier off" and the
-  // level the board boots with. It is driven high only inside a burst.
+  // level the board boots with. It goes high only while there is beeping to do.
+  s_paOn = false;
   gpio_set_level(PIN_PA, 0);
 
   i2s_chan_config_t channels = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -149,9 +166,10 @@ static bool sessionUp() {
   es8311_codec_cfg_t es8311 = {};
   es8311.ctrl_if = s_ctrlIf;
   es8311.codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH;
-  // The driver's own PA handling holds the amplifier on for the whole session;
-  // this code gates it per burst instead, which is also what makes "no tone
-  // with the amplifier off" a control the microphone can be shown.
+  // The driver would hold the amplifier on for the whole session, beeping or
+  // not; this code holds it on only while there is beeping to do, which is what
+  // makes "no tone with the amplifier off" a control the microphone can be
+  // shown.
   es8311.pa_pin = -1;
   es8311.use_mclk = true;
   // Otherwise the right slot of a recording is the DAC's own output, and a
@@ -186,6 +204,7 @@ static bool sessionUp() {
 
 static void sessionDown() {
   s_sessionUp = false;
+  s_paOn = false;
   gpio_set_level(PIN_PA, 0);
   // Closing the codec disables both i2s channels on the way out, and disabling
   // an already disabled channel is an error the driver logs.
@@ -230,8 +249,7 @@ static void sessionDown() {
 // would leave the amplifier, the DMA buffers and the PM locks with no way back
 // — `beep off` cannot be heard by a task parked inside a write.
 static bool burst() {
-  gpio_set_level(PIN_PA, 1);
-  vTaskDelay(pdMS_TO_TICKS(PA_SETTLE_MS));
+  amplifier(true);
   bool ok = true;
   for (uint32_t played = 0; played < BURST_MS; played += CHUNK_MS) {
     size_t written = 0;
@@ -244,7 +262,6 @@ static bool burst() {
     }
   }
   vTaskDelay(pdMS_TO_TICKS(DMA_DRAIN_MS));
-  gpio_set_level(PIN_PA, 0);
   return ok;
 }
 
@@ -262,6 +279,12 @@ static void audioTask(void *) {
     }
     printf("BEEP session up\n");
     while (s_beepWanted || s_captureWanted) {
+      // Between bursts the amplifier stays enabled; with nothing left to play
+      // it must not, or `micdump` with the beeper off would be recording a live
+      // speaker instead of the control it is meant to be.
+      if (!s_beepWanted) {
+        amplifier(false);
+      }
       if (s_beepWanted && !burst()) {
         s_beepWanted = false;
       }

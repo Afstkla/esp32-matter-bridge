@@ -279,6 +279,34 @@ The symptom is a cluster count one short of the same device type built with
 cluster; `add()` does create Identify, which is why adding it by hand appeared
 to do nothing. `walk <endpoint>` prints the cluster list and settles it.
 
+## A bridged node has nowhere to send an Identify
+
+`bridged_node::add()` creates exactly one cluster — Bridged Device Basic
+Information — on top of the Descriptor its `create()`/`resume()` wrapper adds.
+No Identify. So the endpoint that carries the accessory's *name*, and therefore
+the one an ecosystem's "identify this accessory" button aims at, has no Identify
+cluster unless you create one by hand:
+
+```cpp
+cluster::identify::config_t identify;
+identify.identify_type = (uint8_t)Identify::IdentifyTypeEnum::kAudibleBeep;
+cluster::identify::create(parent, &identify, CLUSTER_FLAG_SERVER);
+```
+
+`<type>::add()` *does* create Identify for the app device types — a light, a
+plug-in unit, a sensor all get one from their own `add()` — which is why this is
+easy to miss: the children of a composed device have Identify and the parent
+does not.
+
+Nothing else is needed to make the callback fire. `cluster::identify::create`
+registers an init callback that builds CHIP's `Identify` object out of the
+`IdentifyType` attribute when the endpoint is enabled, and that object calls the
+node's `identification::callback_t` with `START` / `STOP` / `EFFECT` and the
+endpoint id. `IdentifyType` is worth setting rather than defaulting: it tells
+the controller what the device is about to do, and `kAudibleBeep` (3) is honest
+about a device whose identify is a beep, where the default 0 (`kNone`) claims
+nothing observable will happen.
+
 ## `attribute::update()` is not what a controller reads
 
 esp_matter keeps an attribute store. CHIP now also has a *cluster object* per
