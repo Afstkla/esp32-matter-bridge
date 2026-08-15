@@ -34,7 +34,7 @@ static const uint32_t TONE_HZ = 2000;
 static const int16_t TONE_AMPLITUDE = 20000;
 static const uint32_t BURST_MS = 200;
 // Beep, then wait: with the amplifier's warm-up and the drain below, this is a
-// beep every two seconds.
+// beep every 1.7 seconds (200 ms + 1500 ms).
 static const uint32_t GAP_MS = 1500;
 static const int OUT_VOLUME = 80;
 // Only the microphone capture uses this, and what it is pointed at is

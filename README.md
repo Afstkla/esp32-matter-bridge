@@ -161,7 +161,7 @@ port at a time.
 | `tap X Y` | inject a tap at a coordinate |
 | `bright 0-255` | set panel brightness |
 | `sleep` / `wake` | power the display module down / back up and redraw |
-| `beep [on\|off]` | beep every two seconds until told to stop, or report the state |
+| `beep [on\|off]` | beep every 1.72 seconds until told to stop, or report the state |
 | `finder [on\|off\|identify]` | start or stop a finder session the way a controller would, or fire the 5 s Identify burst |
 | `micdump <ms>` | record from the onboard microphone and stream it as base64 (see below) — **debug surface** |
 | `qr` | toggle the pairing screen |
@@ -252,7 +252,7 @@ uv run --with pyserial python tools/beeptest.py
 
 It records a second with the beeper off, turns the beeper on, records another
 two and a half, and prints the energy at the beep's own 2 kHz per 20 ms
-window. A working chain shows a flat 200 ms block of tone every two seconds
+window. A working chain shows a flat 200 ms block of tone every 1.72 seconds
 and nothing at all between bursts or in the control capture. The board is
 never reset.
 
@@ -433,8 +433,9 @@ It stops in four ways, and all four leave Home's tile off, because the device
 writes the switch back rather than only reacting to it:
 
 - turning it off from Home,
-- **touching the screen, or pressing PWR or BOOT** — anything you do to a
-  beeping Genie silences it, and that touch or press does nothing else,
+- **touching the screen, or pressing PWR or BOOT** — touch stops it while the
+  screen is awake; once the screen has gone back to sleep, press PWR or BOOT,
+  and that touch or press does nothing else,
 - **after ten minutes**, so a session nobody heard does not run the cell down,
 - five seconds after an **Identify**, which is what Home's "identify accessory"
   button sends: a short burst rather than a whole session.

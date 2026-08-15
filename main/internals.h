@@ -23,9 +23,9 @@ void internalsPoll();
 // Finder child's OnOff attribute, which the device writes back whenever a
 // session ends by itself.
 //
-// A human stopping it locally goes through here — anything they do to the
-// device counts, so this is called from the touch and key paths rather than
-// from a control of its own.
+// A human stopping it locally goes through here. Touch stops it while the
+// screen is awake; once the screen sleeps, only PWR or BOOT can stop it.
+// Called from the touch and key paths rather than from a control of its own.
 void internalsFinderStop();
 
 // True while a session is running. The ui task wakes the screen on the edge:

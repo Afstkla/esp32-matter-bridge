@@ -133,6 +133,10 @@ been enabled yet` in the log.
 - While a session is up the i2s driver holds **two `i2s_driver`
   `APB_FREQ_MAX`** PM locks (one per channel). `i2s_del_channel` deletes them:
   after `beep off`, `power locks` lists only `usb` again. Nothing lingers.
+  These locks **suspend automatic light sleep for the entire session** — the
+  chip stays at or above `PM_MODE_APB_MAX` while audio is running, and light
+  sleep resumes only after the session ends (bounded by the 10-minute finder
+  timeout).
 - The DMA buffers cost about **12 KB of internal heap** for the session
   (internal free 36.5 KB idle → 24.0 KB with the chain up; 35.7 KB → 23.1 KB
   with Matter up and advertising, on an uncommissioned board).

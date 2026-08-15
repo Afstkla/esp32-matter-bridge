@@ -533,6 +533,7 @@ void internalsBegin() {
   on_off_plug_in_unit::config_t finder;
   finder.on_off.on_off = false;
   finder.on_off_lighting.start_up_on_off = nullptr;
+  finder.identify.identify_type = (uint8_t)Identify::IdentifyTypeEnum::kAudibleBeep;
   child = makeChild(s_ids.finder, (void *)&s_finder);
   if (child != nullptr && on_off_plug_in_unit::add(child, &finder) == ESP_OK) {
     child = addChild(child, "finder");
