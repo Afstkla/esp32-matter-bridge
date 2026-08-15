@@ -248,7 +248,7 @@ static void pollRequests() {
       // down, so waking also has to redraw.
       noteActivity();
       drawScreen();
-      printf("WAKE\n");
+      printf("%s\n", panelAsleep() ? "WAKE failed" : "WAKE");
     }
   }
   if (s_swipeWanted != 0) {

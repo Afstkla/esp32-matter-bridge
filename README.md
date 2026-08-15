@@ -170,7 +170,7 @@ port at a time.
 | `decommission` | erase all fabrics and restart |
 | `touchdump <ms>` | stream touch register changes |
 | `screendump` | stream the framebuffer as base64 (see below) |
-| `power [locks\|timers\|rails\|on\|off\|80\|160\|240\|usbsim on\|off]` | power management tuning and drain instrumentation — **debug surface** |
+| `power [locks\|timers\|rails\|on\|off\|80\|160\|240\|active <ms>\|usbsim on\|off]` | power management tuning and drain instrumentation — **debug surface** |
 | `ps none\|min\|max` | set WiFi power save mode |
 | `battlog` | dump the battery drain log, oldest first |
 | `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |

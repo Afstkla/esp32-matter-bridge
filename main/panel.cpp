@@ -80,7 +80,7 @@ static esp_err_t releaseResets() {
 // gone. SDA, SCL and the touch INT stay pulled up regardless — they are shared
 // with the PMU or pulled up off-chip, so nothing here can float them, and they
 // back-feed the dead digitiser through its protection diodes at whatever the
-// pull-ups allow (order 0.4 mA; see the task-2 report).
+// pull-ups allow (order 0.4 mA).
 static void cutPower() {
   ESP_ERROR_CHECK_WITHOUT_ABORT(i2cWriteReg(s_tca, 0x01, 0x00));
 }
