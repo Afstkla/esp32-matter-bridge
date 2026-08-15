@@ -424,8 +424,10 @@ room and back, hurries it along.
 The third child is the **Finder**: an On/Off switch that makes the device beep
 until something stops it, for the evening the Genie is under a cushion. Turning
 it on from Home starts a 2 kHz beep every 1.7 seconds and flashes the screen if
-the screen happens to be awake; the first beep is instant, because the amplifier
-is woken once for the session rather than once per beep.
+the screen happens to be awake. The amplifier is woken once for the session
+rather than once per beep, which is what makes the gap 1.7 seconds rather than
+1.9 — the first beep still waits out the amplifier's 200 ms wake, every one
+after it does not.
 
 It stops in four ways, and all four leave Home's tile off, because the device
 writes the switch back rather than only reacting to it:

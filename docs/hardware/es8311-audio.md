@@ -50,15 +50,24 @@ enabling the amplifier 250 ms ahead of the same 200 ms burst restored the full
 
 **That wait is paid once per session, not once per beep.** `PA_CTRL` stays high
 across the gaps for as long as there is beeping to do, and only goes low when
-the beeping stops — which costs the amplifier's ~4 mA quiescent draw for the
-length of a session (minutes, at most) and buys two things: the *first* beep of
-a finder session is instant rather than 200 ms late, and every later beep is a
-full-length one. Measured, mic-verified, at the beep cadence either way:
+the beeping stops. It costs the amplifier's ~4 mA quiescent draw for the length
+of a session (minutes, at most).
+
+Be precise about what that buys, because it is easy to overclaim. **The first
+beep of a session is not faster**: `amplifier(true)` is called from inside
+`burst()`, so burst 1 still waits out the mute window before its first sample.
+**Bursts were already full-length before the change** — pre-enabling per burst
+was Task 1's whole fix. What changes is that beeps 2..N skip the mute window
+entirely, so the cadence tightens by exactly one `PA_SETTLE_MS`, and the
+amplifier is no longer switched on and off between every burst:
 
 | `PA_CTRL` | beep spacing | tone per burst |
 |---|---|---|
 | raised per burst | 1.92 s | 210 ms |
 | held for the session | 1.72 s | 210 ms |
+
+Mic-verified both ways. The 200 ms of the difference is the settle wait, no
+longer spent between beeps.
 
 The amplifier still drops on `beep off` even while a `micdump` holds the
 session open, which is what keeps "no tone with the amplifier off" available as

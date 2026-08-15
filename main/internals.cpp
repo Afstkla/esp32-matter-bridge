@@ -229,20 +229,26 @@ static void persistIds() {
   nvs_commit(s_nvs);
 }
 
+// Logged rather than silent because it is a one-way door: the next persistIds()
+// overwrites whatever shape was there, and an id that came out wrong renumbers
+// a child that Home has already learnt. The byte count is the whole decision —
+// reading it in the boot log is the only chance to catch a blob this code did
+// not expect before Home resyncs against the result.
 static void loadIds() {
   s_ids = {};
   size_t stored = 0;
-  if (nvs_get_blob(s_nvs, IDS_KEY, nullptr, &stored) != ESP_OK) {
-    return;
+  if (nvs_get_blob(s_nvs, IDS_KEY, nullptr, &stored) == ESP_OK) {
+    if (stored == sizeof(Ids)) {
+      nvs_get_blob(s_nvs, IDS_KEY, &s_ids, &stored);
+    } else {
+      IdsV2 v2 = {};
+      if (stored == sizeof(v2) && nvs_get_blob(s_nvs, IDS_KEY, &v2, &stored) == ESP_OK) {
+        s_ids = {v2.parent, v2.temperature, v2.backlight, 0};
+      }
+    }
   }
-  if (stored == sizeof(Ids)) {
-    nvs_get_blob(s_nvs, IDS_KEY, &s_ids, &stored);
-    return;
-  }
-  IdsV2 v2 = {};
-  if (stored == sizeof(v2) && nvs_get_blob(s_nvs, IDS_KEY, &v2, &stored) == ESP_OK) {
-    s_ids = {v2.parent, v2.temperature, v2.backlight, 0};
-  }
+  ESP_LOGI(TAG, "stored ids: %u bytes -> parent %u, temperature %u, backlight %u, finder %u",
+           (unsigned)stored, s_ids.parent, s_ids.temperature, s_ids.backlight, s_ids.finder);
 }
 
 // Reclaims the id if there is one to reclaim. Same rule as bridge.cpp: resume()
