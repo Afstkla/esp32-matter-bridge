@@ -7,5 +7,9 @@
 void i2cInit();
 i2c_master_dev_handle_t i2cAddDevice(uint8_t address);
 
+// For a driver that adds its own device to the bus rather than being poked
+// through the helpers below — the ES8311's, so far.
+i2c_master_bus_handle_t i2cBus();
+
 esp_err_t i2cWriteReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value);
 esp_err_t i2cReadReg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *out, size_t len);

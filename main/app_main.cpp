@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "audio.h"
 #include "bridge.h"
 #include "builder.h"
 #include "console.h"
@@ -520,6 +521,9 @@ extern "C" void app_main(void) {
 
   consoleStart();
   registerCommands();
+  // Owns its own task: a beep is a two-second cycle of blocking writes, which
+  // has no business inside the ui task's 20 ms pass.
+  audioBegin();
 
   // builderBegin() creates the node; a second bridgeBegin() here would create a
   // second one and log a failure that is not real.

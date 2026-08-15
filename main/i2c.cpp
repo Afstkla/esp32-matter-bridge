@@ -18,6 +18,10 @@ void i2cInit() {
   ESP_ERROR_CHECK(i2c_new_master_bus(&config, &s_bus));
 }
 
+i2c_master_bus_handle_t i2cBus() {
+  return s_bus;
+}
+
 i2c_master_dev_handle_t i2cAddDevice(uint8_t address) {
   i2c_device_config_t config = {};
   config.dev_addr_length = I2C_ADDR_BIT_LEN_7;

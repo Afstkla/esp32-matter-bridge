@@ -161,6 +161,8 @@ port at a time.
 | `tap X Y` | inject a tap at a coordinate |
 | `bright 0-255` | set panel brightness |
 | `sleep` / `wake` | power the display module down / back up and redraw |
+| `beep [on\|off]` | beep every two seconds until told to stop, or report the state |
+| `micdump <ms>` | record from the onboard microphone and stream it as base64 (see below) — **debug surface** |
 | `qr` | toggle the pairing screen |
 | `idle N` | blank the screen after N seconds, 0 to never |
 | `reset slots` | remove every accessory (restarts) |
@@ -237,6 +239,28 @@ picture. The dump runs on the console task while the ui task keeps drawing,
 so it can tear if a screen changes mid-dump — screens here are static except
 for a ~150 ms swipe animation, so in practice a dump almost always lands on a
 still frame.
+
+## Verifying the beep without ears
+
+The microphone and the speaker hang off the same ES8311, so the device can
+hear itself. `tools/beeptest.py` is the whole check:
+
+```sh
+uv run --with pyserial python tools/beeptest.py
+```
+
+It records a second with the beeper off, turns the beeper on, records another
+two and a half, and prints the energy at the beep's own 2 kHz per 20 ms
+window. A working chain shows a flat 200 ms block of tone every two seconds
+and nothing at all between bursts or in the control capture. The board is
+never reset.
+
+The beeper itself is a session: `beep on` powers the codec, the I2S channels
+and the amplifier, `beep off` tears every one of them down again (after which
+`power locks` lists no `i2s_driver` lock). The amplifier is woken 200 ms
+before each burst because it passes nothing for its first ~175 ms — see
+[docs/hardware/es8311-audio.md](docs/hardware/es8311-audio.md), where that and
+the rest of the bring-up lore lives.
 
 ## The `esp_lcd` override
 

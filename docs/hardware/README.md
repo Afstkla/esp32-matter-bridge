@@ -11,7 +11,7 @@ is stated.
 | [cst820-touch.md](cst820-touch.md) | The digitiser: part-number confusion, register bring-up, shared power rail, INT on GPIO21 |
 | [axp2101-pmu.md](axp2101-pmu.md) | The PMU: PEK button, charging fix, what it can and cannot measure, rails |
 | [tca9554-expander.md](tca9554-expander.md) | The IO expander that gates the panel rail and both reset lines |
-| [es8311-audio.md](es8311-audio.md) | Codec, amplifier, I2S pins — desk research, bring-up in progress |
+| [es8311-audio.md](es8311-audio.md) | Codec, amplifier, I2S pins — brought up and measured, including the amplifier's 175 ms wake |
 | [qmi8658-imu.md](qmi8658-imu.md) | IMU — present, unused |
 | [pcf85063-rtc.md](pcf85063-rtc.md) | RTC — present, unused |
 
