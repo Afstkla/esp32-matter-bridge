@@ -28,16 +28,55 @@ and "add another accessory" turn out to be one feature, not two.
 Nothing else is required. Buttons use the two keys already on the board:
 **BOOT** (top) steps the active level up, **PWR** (bottom) steps it down.
 
+## Why ESP-IDF, not Arduino
+
+This firmware used to build on arduino-esp32/pioarduino. It moved to native
+ESP-IDF because the prebuilt Arduino libraries hard-code two `sdkconfig`
+switches this project needs and cannot change:
+
+- `CONFIG_PM_ENABLE` — automatic light sleep. The prebuilt libs ship without
+  it, so the Arduino build could only do WiFi modem sleep plus manual CPU
+  frequency scaling; the ESP-IDF build runs `esp_pm_configure()` with real DFS
+  and light sleep on battery.
+- `CONFIG_ESP_MATTER_MEM_ALLOC_MODE_EXTERNAL` — the Matter data model
+  allocates from PSRAM instead of internal DRAM. The prebuilt libs pin
+  `esp_matter_mem_calloc()` to `MALLOC_CAP_INTERNAL`, so every cluster and
+  attribute the stack builds at runtime ate the one pool that is scarce, and
+  three accessories were enough to starve WiFi's own allocations.
+
+Measured effect: with six accessories plus the board's own internals
+accessory, free internal DRAM is **~46.6 KB** on this build versus **~19 KB**
+on the old Arduino one — the six accessories cost 2.1 KB of internal DRAM and
+13.9 KB of PSRAM combined, instead of internal DRAM alone.
+
 ## Quick start
 
 ```sh
-pio run -e matter-amoled-1-8 -t upload
+. ~/esp/esp-idf/export.sh
+idf.py build
 ```
 
-A fresh board has no network and does not need one. It advertises over BLE, and
-the controller hands over WiFi credentials as part of pairing: Matter stores
-them itself and rejoins on every boot, so nothing here keeps a second copy and
-no credential ever enters the source tree.
+Pinned toolchain: **ESP-IDF 5.5.5** at `~/esp/esp-idf` (the version
+`espressif/esp_matter` ^1.6.0 recommends). Managed components
+(`main/idf_component.yml`, pulled on first build): `espressif/esp_matter`
+^1.6.0 and `espressif/esp_lcd_co5300` ^2.1.0.
+
+The board is the sole `/dev/cu.usbmodem*` device (USB-Serial-JTAG) — resolve
+it with `ls /dev/cu.usbmodem*`; the number changes when the board moves USB
+ports.
+
+```sh
+idf.py -p /dev/cu.usbmodem21401 erase-flash flash
+```
+
+The **first** flash on a board must include `erase-flash` — Arduino-era NVS
+content is not compatible with this firmware's layout. Later flashes just need
+`flash`. Only one serial reader may hold the port at a time.
+
+A fresh board has no network and does not need one. It advertises over BLE,
+and the controller hands over WiFi credentials as part of pairing: Matter
+stores them itself and rejoins on every boot, so nothing here keeps a second
+copy and no credential ever enters the source tree.
 
 **2.4 GHz only** — the ESP32-S3 has no 5 GHz radio, and a 5 GHz-only SSID fails
 silently.
@@ -86,34 +125,123 @@ accessory added fills the gap.
 
 ## Serial console
 
-`tools/mctl.py` drives the board over USB. It resets on connect by default;
-pass `--no-reset` to attach to a running device without disturbing it.
+The firmware runs an `esp_console` REPL over USB-Serial-JTAG (prompt
+`genie> `), which echoes input and prints its own prompt — unlike the old
+line protocol. `tools/mctl.py` drives it:
 
 ```sh
 uv run --with pyserial python tools/mctl.py --no-reset diag slots
 uv run --with pyserial python tools/mctl.py --no-reset 'click 0' 'listen 20'
 ```
 
+It resets the board on connect by default; pass `--no-reset` to attach to a
+running device without disturbing it. Only one serial reader may hold the
+port at a time.
+
 | command | what it does |
 | --- | --- |
+| `help` | list every command, built in |
+| `ping` | reply `PONG` |
+| `heap` | free internal and PSRAM heap |
+| `nvs` | NVS entry usage |
 | `diag` | commissioning state, WiFi, IPv6, fabric count |
+| `state` | whether the device holds a fabric |
 | `slots` | list accessories |
 | `types` | list the device types on offer |
 | `add <type>` | add an accessory, e.g. `add Dimmer` |
+| `remove N` | delete an accessory |
+| `click N` | fire a switch press |
+| `on N 0\|1` | drive a level accessory's on/off state |
+| `level N 0-255` | drive a level accessory's brightness |
 | `flag N` | flip a contact or motion sensor |
 | `value N up\|down` | move a temperature or humidity reading |
-| `remove N` | delete an accessory |
-| `swipe left` / `swipe right` | change page, animation included |
+| `swipe left\|right` | change page, animation included |
+| `tap X Y` | inject a tap at a coordinate |
+| `bright 0-255` | set panel brightness |
+| `sleep` / `wake` | blank / unblank and redraw the screen |
+| `qr` | toggle the pairing screen |
+| `idle N` | blank the screen after N seconds, 0 to never |
 | `reset slots` | remove every accessory (restarts) |
-| `click N` | fire a switch press |
-| `on N 0\|1`, `level N 0-255` | drive a level accessory |
 | `wifi` | which network the driver actually joined |
-| `pairing`, `state`, `decommission` | Matter commissioning |
+| `pairing` | manual pairing code and QR payload |
 | `window` | reopen a 3-minute commissioning window without unpairing |
-| `sleep`, `wake`, `idle N` | screen |
-| `nvs`, `power`, `touchdump` | diagnostics |
+| `decommission` | erase all fabrics and restart |
+| `touchdump <ms>` | stream touch register changes |
+| `screendump` | stream the framebuffer as base64 (see below) |
+| `power [locks\|on\|off\|80\|160\|240]` | power management tuning — **debug surface** |
+| `ps none\|min\|max` | set WiFi power save mode |
+| `battlog` | dump the battery drain log, oldest first |
+| `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |
 
-`listen N` and `sleep N` are client-side helpers for scripting a session.
+`listen N` and `sleep N` in `mctl.py` are client-side helpers for scripting a
+session, not device commands.
+
+## Verifying the screen without eyes
+
+`tools/screenshot.py` drives `screendump` and turns the answer into a PNG,
+which is how this repo checks rendering changes without a human looking at
+the panel:
+
+```sh
+uv run --with pyserial,pillow python tools/screenshot.py shot.png swipe left
+```
+
+Any arguments after the output path run as console commands first, so the
+usual pattern is "do something on screen, then capture it" in one call. The
+board is never reset — it photographs whatever state it is already in.
+`screendump` streams the framebuffer as base64 lines terminated by
+`SCREENDUMP END`; WiFi log lines land in the middle of that stream and are
+filtered by alphabet (base64 only), and a short or garbled payload is
+retried up to three times rather than decoded into a plausible-but-wrong
+picture. The dump runs on the console task while the ui task keeps drawing,
+so it can tear if a screen changes mid-dump — screens here are static except
+for a ~150 ms swipe animation, so in practice a dump almost always lands on a
+still frame.
+
+## The `esp_lcd` override
+
+`components/esp_lcd` is a local, patched copy of ESP-IDF 5.5.5's `esp_lcd`
+component — see [its `PATCH.md`](components/esp_lcd/PATCH.md) for the exact
+diff. It exists because stock `esp_lcd` leaks an in-flight transaction slot:
+a PSRAM-sourced DMA chunk that hits a TX underflow still completes and posts
+a result, just flagged `ESP_ERR_INVALID_STATE`, and the stock drain loop in
+`esp_lcd_panel_io_spi.c` consumes that result without decrementing
+`num_trans_inflight` before bailing. The transaction count then runs one
+ahead of reality forever, and the next frame's drain blocks on
+`portMAX_DELAY` waiting for a result that will never arrive — the ui task
+wedges, both cores go idle, and only the REPL stays alive. The patch routes
+the five drain loops through a helper that treats that error as "recycled
+with a fault" (log a warning, keep counting) instead of aborting.
+
+The override is pinned to IDF 5.5.5: its `CMakeLists.txt` prints a CMake
+warning if built against any other version, because it is a copy of one
+version's component, not a fork that tracks upstream. It is an upstream
+candidate — the same leak is in all five drain loops in stock `esp_lcd`, on
+any IDF version with the same drain shape.
+
+## Power model
+
+Automatic light sleep (`CONFIG_PM_ENABLE`, DFS 80–240 MHz) runs only on
+**battery**: an `ESP_PM_NO_LIGHT_SLEEP` lock is held while USB VBUS is
+present, so the console stays alive and responsive whenever the board is
+plugged in, and is released only on a PMU reading that confirms VBUS is
+gone. WiFi power save defaults to `WIFI_PS_MAX_MODEM`, tunable at runtime
+with `ps none|min|max` (persisted in NVS).
+
+An **uncommissioned** device will not sleep even on battery: NimBLE holds its
+own `NO_LIGHT_SLEEP` lock while advertising, and this firmware advertises
+until a fabric is joined. Once commissioned, BLE tears down
+(`CONFIG_USE_BLE_ONLY_FOR_COMMISSIONING`) and the lock releases with it.
+
+Drain is measured with `battlog`: a 144-entry ring in NVS, sampled every 10
+minutes (`mv`/`pct`/`flags` with USB/charging/boot bits), giving a rolling
+24-hour window. It survives reboots and dumps oldest-first.
+
+`power` (debug surface) reports the live PM config, WiFi PS mode, last flush
+time and PMU reading; `power locks` dumps the PM lock table; `power
+80|160|240` pins the clock for testing and `power off` disables light sleep
+entirely, falling back to the fixed 240 MHz clock — the escape hatch if the
+panel path ever misbehaves under DFS again.
 
 ## Genie's own internals
 
@@ -124,12 +252,15 @@ thing. Apple Home draws it as a single tile. Inside are the PMU die
 temperature, the battery percentage, and the display brightness, which really
 does dim the panel.
 
-It costs about 8 KB of heap, which is most of the headroom on this board, and
-is why six accessories is the cap rather than a dozen.
+Six accessories is the cap because the tile grid is six-to-a-page by design,
+not because memory demands it — see "Why ESP-IDF" above for what six actually
+cost once the data model moved to PSRAM.
 
 ## What works, and what does not
 
-Established on real hardware against Apple Home:
+Established on real hardware against Apple Home (Arduino firmware; the port
+carries the same Matter data model, so this behaviour is expected to carry
+over unchanged):
 
 | | |
 | --- | --- |
@@ -148,32 +279,45 @@ encoding is a switch press per step.
 
 ## Gotchas worth knowing
 
-Notes for anyone doing Matter on the Arduino ESP32 core — each of these cost
-real debugging time. Longer write-up in [docs/matter-notes.md](docs/matter-notes.md).
+Notes from this port, each of which cost real debugging time. The Arduino-era
+write-up (naming, BLE-transport-by-core-version, the old upload tool's
+partition trap) is retired along with the toolchain that caused it; what's
+still true from it is folded in below. Longer background on the Matter-side
+items: [docs/matter-notes.md](docs/matter-notes.md).
 
-- **A bridged accessory costs 53 KB of internal RAM on esp_matter 1.5** if you
-  name it with `create_node_label()`. That helper forces
-  `ATTRIBUTE_FLAG_NONVOLATILE`, and the flag — not the 32-byte name — is what
-  allocates. Three accessories exhaust internal DRAM, after which WiFi cannot
-  start and `esp_matter::start()` fails. Create the attribute directly instead.
-- **BLE commissioning depends on the core version.** arduino-esp32 3.1.x ships
-  its libs without `CONFIG_ENABLE_CHIPOBLE`, so the "phone hands the device its
-  WiFi credentials" flow does not exist there at all. 3.3.x enables it on
-  NimBLE out of the box — see [docs/matter-notes.md](docs/matter-notes.md).
-- **Do not let a data partition cover `0xE000`.** The upload tool writes
-  `boot_app0.bin` to that fixed offset regardless of the partition CSV.
-- **`Matter.begin()` cannot start a bridge.** It requires a private flag that
-  only the library's own endpoint classes can set.
-- **An endpoint costs 1.8-4 KB of heap.** esp_matter builds its data model at
-  runtime rather than from ZAP-generated tables in flash, so every cluster's
-  mandatory `ClusterRevision`, `FeatureMap`, `AttributeList` and command lists
-  are heap records: a contact sensor holds 18 attributes to publish one bool.
-  `emberAfSetDynamicEndpoint()`, which the upstream bridge example uses with
-  static metadata, is declared in the shipped headers but not compiled into the
-  prebuilt libraries. Run out and the SPI driver asserts mid-transfer rather
-  than failing cleanly.
-- **Progress logs do not exist.** The prebuilt libs are compiled at log level
-  ERROR, so `ESP_LOGI` inside CHIP is compiled out. Errors still appear.
+- **Only the ui task may touch the panel or the framebuffer.** Console
+  commands that affect the screen (`bright`, `sleep`, `wake`, `swipe`, `qr`,
+  `tap`) set an intent that the ui task's own tick applies; nothing calls
+  `panelFlush` from the REPL task. Two tasks racing to flush left a
+  done-semaphore counting frames nobody was waiting on.
+- **The QSPI clock is 40 MHz, not 80.** 80 MHz underflows the DMA once the
+  framebuffer lives in PSRAM under `esp_lcd` — the Arduino build got away
+  with it because its driver's transaction accounting happened to tolerate
+  the resulting underflow; this one does not, until the `esp_lcd` override
+  above recycles the fault instead of wedging on it.
+- **Matter attributes declared `NULLABLE` reject a plain value.** `CurrentLevel`
+  and similar attributes need `esp_matter_nullable_uint8` (or the matching
+  nullable wrapper for the type), not the plain `esp_matter_uint8` —
+  `attribute::update` on the plain form fails silently with
+  `ESP_ERR_INVALID_ARG` (258), the local UI still looks right because it reads
+  its own cached state, and no controller ever sees the write. This bug was
+  latent in the Arduino firmware too.
+- **Endpoint IDs and `resume()`.** Endpoint IDs come from one counter that is
+  only persisted by endpoints created *after* `esp_matter::start()`, and
+  `bridged_node::resume()` only accepts a stored ID below the counter's
+  current value — so accessories must be built after `start()`, not before
+  it. Still true, still the whole trick behind adding an accessory without a
+  reboot.
+- **`create_node_label()` forces `ATTRIBUTE_FLAG_NONVOLATILE`.** Use
+  `attribute::create()` directly for a bridged accessory's name instead —
+  under `CONFIG_ESP_MATTER_MEM_ALLOC_MODE_EXTERNAL` the RAM cost of that flag
+  is no longer the crisis it was on Arduino, but dropping `NONVOLATILE` still
+  matters for correctness: Matter then relies on this firmware to reapply the
+  name from NVS on boot rather than persisting it itself, so a name a
+  controller writes directly will not survive a restart.
+- **`screendump`/`screenshot.py` is how this repo verifies rendering** — see
+  above. There is no other way to confirm a screen change without physically
+  looking at the board.
 
 ## Licence
 
