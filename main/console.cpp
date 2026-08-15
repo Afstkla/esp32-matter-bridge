@@ -2,6 +2,7 @@
 
 #include <cstdio>
 
+#include "esp_debug_helpers.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
 
@@ -24,6 +25,13 @@ static int cmdPing(int argc, char **argv) {
 static int cmdHeap(int argc, char **argv) {
   printf("HEAP internal=%u psram=%u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  return 0;
+}
+
+// Runs on the console task, so it works while another task is parked — which
+// is the whole point: it names the line a wedged task is blocked on.
+static int cmdBacktrace(int argc, char **argv) {
+  esp_backtrace_print_all_tasks(16);
   return 0;
 }
 
@@ -54,6 +62,7 @@ void consoleStart() {
   consoleRegisterCmd("ping", "Reply PONG", cmdPing);
   consoleRegisterCmd("heap", "Show free internal and PSRAM heap", cmdHeap);
   consoleRegisterCmd("nvs", "Show NVS entry usage", cmdNvs);
+  consoleRegisterCmd("bt", "Backtrace every task", cmdBacktrace);
 
   ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }
