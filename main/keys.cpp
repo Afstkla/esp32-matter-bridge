@@ -232,7 +232,7 @@ void pmuDumpRails() {
     uint8_t volt = pmuReadReg(rail.voltReg);
     if (rail.ldoLadder) {
       printf("RAIL %-7s %s %umV (0x%02X)\n", rail.name, on ? "on " : "off",
-             500 + 100 * (volt & 0x1F), volt);
+             (unsigned)(500 + 100 * (volt & 0x1F)), volt);
     } else {
       printf("RAIL %-7s %s raw 0x%02X\n", rail.name, on ? "on " : "off", volt);
     }

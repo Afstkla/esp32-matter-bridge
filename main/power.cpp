@@ -52,14 +52,24 @@ static nvs_handle_t s_nvs = 0;
 static BattSample s_log[LOG_ENTRIES];
 static uint16_t s_head = 0;
 static esp_pm_lock_handle_t s_awakeOnUsb = nullptr;
-static bool s_awakeHeld = false;
+// The ui task writes this; `power` reads it from the console task.
+static volatile bool s_awakeHeld = false;
 
 // Bench instrument, never persisted and off at boot: on USB the PMU reports
 // VBUS, the usb lock is held, and the chip never so much as attempts a light
 // sleep — so the one state worth measuring is the one a cable makes
 // unobservable. With this on the device behaves as if it were on battery.
-static bool s_pretendBattery = false;
+//
+// Written by the console task, read by the ui task, exactly as app_main.cpp
+// routes every other console intent: the ui tick owns the lock and applies
+// this, so `power usbsim` never touches it. An esp_pm lock is refcounted, and
+// two tasks running holdAwake()'s read-decide-write concurrently can both
+// acquire and only one release — a leaked lock that pins the chip awake while
+// every readout swears it is free.
+static volatile bool s_pretendBattery = false;
 
+// Only ever called from the ui task, plus once from powerBegin() before that
+// task exists.
 static void holdAwake(bool want) {
   if (s_awakeOnUsb == nullptr || want == s_awakeHeld) {
     return;
@@ -170,7 +180,9 @@ static int cmdPower(int argc, char **argv) {
       return 1;
     }
     s_pretendBattery = strcasecmp(argv[2], "on") == 0;
-    holdAwake(!s_pretendBattery && pmuStatus().onUsb);
+    // The next ui tick moves the lock, so `usb_lock=` below still reads the old
+    // state for up to one tick. `usbsim=` is the intent; run `power` again for
+    // the settled answer.
     report();
     return 0;
   }
