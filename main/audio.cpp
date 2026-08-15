@@ -225,19 +225,27 @@ static void sessionDown() {
   }
 }
 
-static void burst() {
+// False means give up on the session: an i2s that stops taking a chunk within
+// twice the time the whole burst lasts is wedged, and waiting on it forever
+// would leave the amplifier, the DMA buffers and the PM locks with no way back
+// — `beep off` cannot be heard by a task parked inside a write.
+static bool burst() {
   gpio_set_level(PIN_PA, 1);
   vTaskDelay(pdMS_TO_TICKS(PA_SETTLE_MS));
+  bool ok = true;
   for (uint32_t played = 0; played < BURST_MS; played += CHUNK_MS) {
     size_t written = 0;
-    esp_err_t err = i2s_channel_write(s_tx, s_tone, sizeof(s_tone), &written, portMAX_DELAY);
+    esp_err_t err =
+        i2s_channel_write(s_tx, s_tone, sizeof(s_tone), &written, pdMS_TO_TICKS(2 * BURST_MS));
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "write failed: %s", esp_err_to_name(err));
+      ok = false;
       break;
     }
   }
   vTaskDelay(pdMS_TO_TICKS(DMA_DRAIN_MS));
   gpio_set_level(PIN_PA, 0);
+  return ok;
 }
 
 static void audioTask(void *) {
@@ -254,8 +262,8 @@ static void audioTask(void *) {
     }
     printf("BEEP session up\n");
     while (s_beepWanted || s_captureWanted) {
-      if (s_beepWanted) {
-        burst();
+      if (s_beepWanted && !burst()) {
+        s_beepWanted = false;
       }
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(s_beepWanted ? GAP_MS : 50));
     }
