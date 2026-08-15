@@ -54,6 +54,7 @@ static i2c_master_dev_handle_t s_touch = nullptr;
 static uint16_t *s_frame = nullptr;
 static bool s_asleep = false;
 static SemaphoreHandle_t s_flushDone = nullptr;
+static uint32_t s_lastFlushUs = 0;
 
 // EXIO0 = LCD_RESET, EXIO1 = TP_RESET, EXIO2 = DSI_PWR_EN. Neither reset line
 // reaches a GPIO on this board, so the panel driver is created without a reset
@@ -214,6 +215,7 @@ void panelFlush() {
   // previous frame, which would put every flush from then on one frame out of
   // phase — drawing over a buffer the DMA is still reading.
   xSemaphoreTake(s_flushDone, 0);
+  int64_t startedAt = esp_timer_get_time();
   if (ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_draw_bitmap(
           s_panel, 0, 0, PANEL_W, PANEL_H, s_frame)) != ESP_OK) {
     return;
@@ -221,6 +223,7 @@ void panelFlush() {
   if (xSemaphoreTake(s_flushDone, pdMS_TO_TICKS(200)) != pdTRUE) {
     ESP_LOGE(TAG, "flush did not complete");
   }
+  s_lastFlushUs = (uint32_t)(esp_timer_get_time() - startedAt);
   // Measured, not reasoned: the ui task must not re-enter draw_bitmap the
   // instant the completion callback fires, or the recycle loop at the top of
   // the next transfer waits for a descriptor that never arrives. A swipe is
@@ -234,6 +237,10 @@ void panelFlush() {
   // flush is a cheap price for not chasing it further. Double buffer before
   // reaching for anything smoother.
   vTaskDelay(1);
+}
+
+uint32_t panelLastFlushUs() {
+  return s_lastFlushUs;
 }
 
 // Prints the touch registers whenever they change. The digitiser reports

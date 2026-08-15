@@ -8,3 +8,4 @@ build/
 .cache/
 sdkconfig
 managed_components/
+build_nopm/

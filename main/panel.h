@@ -14,6 +14,10 @@ bool panelInit();
 void panelFlush();
 void panelBrightness(uint8_t level);
 
+// How long the last full-frame transfer took. Frequency scaling moves this, so
+// it is the number to watch when the power configuration changes.
+uint32_t panelLastFlushUs();
+
 // Screen only — the CPU stays awake because Matter needs the WiFi link up.
 void panelSleep();
 void panelWake();

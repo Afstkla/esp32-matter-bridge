@@ -4,8 +4,8 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
-#include "console.h"
 #include "i2c.h"
 
 static const char *TAG = "keys";
@@ -120,11 +120,6 @@ static int pmuBattPercent() {
   return pmuBatteryPresent() ? pmuReadReg(REG_BAT_PERCENT) : -1;
 }
 
-static int cmdPower(int argc, char **argv) {
-  pmuReport();
-  return 0;
-}
-
 void keysInit() {
   gpio_config_t bootCfg = {};
   bootCfg.pin_bit_mask = 1ULL << PIN_KEY_BOOT;
@@ -153,8 +148,6 @@ void keysInit() {
     ESP_LOGI(TAG, "AXP2101 ready, INTEN2=0x%02X (bit3 PEK short-press), TS_PIN_CTRL=0x%02X",
              pmuReadReg(REG_INTEN2), pmuReadReg(REG_TS_PIN_CTRL));
   }
-
-  consoleRegisterCmd("power", "Print PMU status", cmdPower);
 }
 
 void pmuReport() {
@@ -178,27 +171,42 @@ void pmuReport() {
          vbusMv, sysMv, pct, vbusIn ? 1 : 0, charging ? 1 : 0, tempC);
 }
 
+// Two callers on the ui task want this on two different schedules — the drain
+// log every ten minutes, the Matter sensors every thirty seconds, the light
+// sleep decision every tick. One cached burst serves all of them: the AXP2101's
+// voltages and fuel gauge do not move faster than this, and the alternative is
+// three polling cadences on a bus the panel also uses.
+static const int64_t CACHE_US = 5 * 1000 * 1000;
+
 PmuStatus pmuStatus() {
+  static PmuStatus cached{};
+  static int64_t readAt = 0;
+
   PmuStatus s{};
   if (!s_pmuReady) {
     return s;
   }
+  int64_t now = esp_timer_get_time();
+  if (readAt != 0 && now - readAt < CACHE_US) {
+    return cached;
+  }
+  readAt = now;
   resetPmuFault();
   uint16_t battMv = pmuBattMv();
   int percent = pmuBattPercent();
   float tempC = pmuTempC();
   bool charging = pmuCharging();
   bool onUsb = pmuVbusIn();
-  if (s_pmuFault) {
-    return PmuStatus{};
+  if (!s_pmuFault) {
+    s.present = true;
+    s.millivolts = battMv;
+    s.percent = (uint8_t)(percent < 0 ? 0 : percent > 100 ? 100 : percent);
+    s.celsius = tempC;
+    s.charging = charging;
+    s.onUsb = onUsb;
   }
-  s.present = true;
-  s.millivolts = battMv;
-  s.percent = (uint8_t)(percent < 0 ? 0 : percent > 100 ? 100 : percent);
-  s.celsius = tempC;
-  s.charging = charging;
-  s.onUsb = onUsb;
-  return s;
+  cached = s;
+  return cached;
 }
 
 bool keyBootPressed() {

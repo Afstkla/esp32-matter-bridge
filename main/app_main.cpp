@@ -19,6 +19,7 @@
 #include "keys.h"
 #include "net.h"
 #include "panel.h"
+#include "power.h"
 #include "qrcode.h"
 #include "theme.h"
 
@@ -290,6 +291,15 @@ static void pollState() {
   drawScreen();
 }
 
+// A dark screen is the device's normal state, and there is nothing to look at
+// between ticks: dropping to four passes a second is what lets tickless idle
+// find a sleep worth taking. The cost is touch — a tap shorter than a tick can
+// fall between two polls, so waking the screen sometimes takes a second tap.
+// The CST816's INT reaches GPIO21 (active low, 10K pull-up) and would turn that
+// poll into an interrupt; wiring it up is its own job.
+static const uint32_t TICK_AWAKE_MS = 20;
+static const uint32_t TICK_ASLEEP_MS = 250;
+
 // One pass is 150 ms at its very worst (a swipe is four flushes), so the 5 s
 // watchdog only fires on something genuinely stuck. It logs a backtrace rather
 // than rebooting, which is the difference between a diagnosable stall and the
@@ -302,6 +312,7 @@ static void uiTask(void *) {
     pollState();
     pollRequests();
     internalsPoll();
+    powerPoll();
     pollKeys();
     pollTouch();
     if (builderNeedsRedraw()) {
@@ -312,7 +323,7 @@ static void uiTask(void *) {
       printf("SLEEP\n");
     }
     esp_task_wdt_reset();
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(panelAsleep() ? TICK_ASLEEP_MS : TICK_AWAKE_MS));
   }
 }
 
@@ -512,12 +523,22 @@ extern "C" void app_main(void) {
   }
   builderResume();
   internalsBegin();
+  // After esp_matter::start(): the WiFi driver has to exist before its
+  // power-save mode can be set.
+  powerBegin();
 
   s_showQr = !bridgeCommissioned();
   if (s_showQr) {
     bridgeOpenPairingWindow();
   }
   noteActivity();
+  // Deliberately unpinned. Core 1 would be the tidy answer — WiFi and the BLE
+  // controller are both pinned to core 0 — but the SPI completion interrupt is
+  // registered from here, on core 0, so pinning the ui task to core 1 makes
+  // every flush handoff a cross-core signal. That handoff is the one that
+  // intermittently wedges inside esp_lcd_panel_draw_bitmap (see panelFlush),
+  // and pinning to core 0 instead would put an 18 ms DMA wait on the radio's
+  // core. Neither is worth choosing blind while the wedge is unexplained.
   xTaskCreate(uiTask, "ui", 8192, nullptr, 4, nullptr);
   ESP_LOGI(TAG, "genie booted");
 }
