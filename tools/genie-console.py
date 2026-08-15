@@ -81,7 +81,14 @@ def main():
     port = int(sys.argv[2]) if len(sys.argv) > 2 else PORT
     secret = os.environ.get("GENIE_SECRET") or getpass.getpass("secret: ")
 
-    with socket.create_connection((host, port), timeout=15) as sock:
+    try:
+        sock = socket.create_connection((host, port), timeout=15)
+    except ConnectionRefusedError:
+        raise SystemExit(f"{host}:{port} refused — no secret set, or wrong address")
+    except (socket.timeout, OSError) as e:
+        raise SystemExit(f"cannot reach {host}:{port}: {e}")
+
+    with sock:
         pending = handshake(sock, secret)
         sock.settimeout(None)
         session(sock, pending)

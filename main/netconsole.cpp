@@ -1,6 +1,7 @@
 #include "netconsole.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +32,10 @@ static const uint8_t MAX_ATTEMPTS = 3;
 static const uint32_t FAIL_DELAY_MS = 3000;
 static const uint32_t AUTH_TIMEOUT_MS = 30000;
 static const uint32_t IDLE_TIMEOUT_MS = 10UL * 60 * 1000;
+// A client that cannot take 5760 bytes (one lwIP send buffer) in ten seconds is
+// not reading, and this task is the only one that can accept the next one.
+static const uint32_t SEND_TIMEOUT_MS = 10000;
+static const uint32_t STOP_WAIT_MS = 15000;
 // How long `passwd clear` takes to free the port, and how coarsely the idle
 // timeout is measured. The ui task already wakes every 250 ms asleep, so a tick
 // this slow adds nothing to the power budget.
@@ -50,6 +55,7 @@ static volatile bool s_stopWanted = false;
 static volatile int s_fd = -1;
 static FILE *s_out = nullptr;
 static FILE *s_ownStdout = nullptr;
+static bool s_clientDead = false;
 static char s_line[CMD_MAX];
 static size_t s_used = 0;
 static bool s_overlong = false;
@@ -68,9 +74,16 @@ static uint32_t nowMs() {
   return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
+// Length-checked on the way out as well as in: NVS is not a trust boundary this
+// side of a flash tool, but a secret that fails the rule the setter enforces is
+// corrupt, and a corrupt secret must not become a short one.
 static bool loadSecret(char *out, size_t size) {
   size_t len = size;
-  return nvs_get_str(s_nvs, SECRET_KEY, out, &len) == ESP_OK && len > 1;
+  if (nvs_get_str(s_nvs, SECRET_KEY, out, &len) != ESP_OK) {
+    return false;
+  }
+  len = strlen(out);
+  return len >= SECRET_MIN && len <= SECRET_MAX;
 }
 
 static void hmacHex(const char *secret, const char *message, char *out) {
@@ -78,7 +91,7 @@ static void hmacHex(const char *secret, const char *message, char *out) {
   mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), (const uint8_t *)secret,
                   strlen(secret), (const uint8_t *)message, strlen(message), mac);
   for (size_t i = 0; i < sizeof(mac); i++) {
-    sprintf(out + 2 * i, "%02x", mac[i]);
+    snprintf(out + 2 * i, 3, "%02x", mac[i]);
   }
 }
 
@@ -91,14 +104,23 @@ static bool sameDigest(const char *a, const char *b) {
   return diff == 0;
 }
 
-// esp_log offers no getter for the installed hook, and nothing else in this
-// firmware installs one, so the restore target is the documented default.
+// esp_log_set_vprintf does hand back the hook it replaced, but capturing that
+// return would leave a window where the tee is already live and the pointer it
+// forwards through is still null. Nothing else in this firmware installs a
+// hook, so the default is the exact restore target and is named directly.
 static const vprintf_like_t BASE_VPRINTF = &vprintf;
 
 // Runs on whichever task logged — the CHIP task holding the stack lock, a WiFi
-// callback, anything — so it must never block. A mutex it does not get and a
-// socket that will not take the bytes both end as a dropped line. Forwarding to
-// the default hook comes first so the USB console never loses a line to this.
+// callback, anything — so it must never wait on anything unbounded. A mutex it
+// does not get and a socket that will not take the bytes both end as a dropped
+// line. Forwarding to the default hook comes first, so a task keeps whatever
+// stdout it already had.
+//
+// Not lock-free: MSG_DONTWAIT still takes lwIP's core lock (this build has
+// CONFIG_LWIP_TCPIP_CORE_LOCKING). That wait is bounded — the core lock is a
+// priority-inheriting mutex, held only for the length of one lwIP operation,
+// and released while a blocking write parks — and it cannot cycle, because
+// nothing holding the core lock ever takes the CHIP stack lock.
 //
 // The session task is skipped because its own stdout is already the socket:
 // teeing there would print every line twice.
@@ -139,6 +161,23 @@ static void say(const char *text) {
   send(s_fd, text, strlen(text), 0);
 }
 
+// The session task's stdout, so every printf a command makes goes here. A
+// client that stops reading fills the send buffer and would otherwise park this
+// task inside a command for as long as it liked — and this is the task that
+// accepts the next client, runs the idle timer and closes the socket, so that
+// stall is the whole feature hanging.
+//
+// SO_SNDTIMEO bounds one send. This bounds the session: after the first send
+// that does not complete, the client is dead, the rest of the command's output
+// is swallowed at memory speed, and dispatch() closes the session as soon as
+// esp_console_run returns. So a wedged client costs one timeout, once, ever.
+static int sessionWrite(void *, const char *data, int len) {
+  if (!s_clientDead && send(s_fd, data, len, 0) != len) {
+    s_clientDead = true;
+  }
+  return len;
+}
+
 static void closeSession(const char *why) {
   if (s_fd < 0) {
     return;
@@ -151,13 +190,13 @@ static void closeSession(const char *why) {
   esp_log_set_vprintf(BASE_VPRINTF);
   if (s_out != nullptr) {
     stdout = s_ownStdout;
-    fclose(s_out);  // takes the fd with it
+    fclose(s_out);  // holds no fd of its own; sessionWrite owns the socket
     s_out = nullptr;
-  } else {
-    close(s_fd);
   }
+  close(s_fd);
   s_fd = -1;
   s_authed = false;
+  s_clientDead = false;
   ESP_LOGI(TAG, "session closed: %s", why);
 }
 
@@ -180,8 +219,11 @@ static void openSession(int fd) {
   s_overlong = false;
   s_attempts = 0;
   s_authed = false;
+  s_clientDead = false;
   s_deadline = nowMs() + AUTH_TIMEOUT_MS;
   s_dropped = 0;
+  timeval sendTimeout = {.tv_sec = (time_t)(SEND_TIMEOUT_MS / 1000), .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
 
   char greeting[16 + NONCE_HEX];
   snprintf(greeting, sizeof(greeting), "CHALLENGE %s\n", nonce);
@@ -191,7 +233,7 @@ static void openSession(int fd) {
 
 static void authenticate(const char *reply) {
   if (strlen(reply) == DIGEST_HEX && sameDigest(reply, s_expected)) {
-    s_out = fdopen(s_fd, "w");
+    s_out = fwopen(nullptr, sessionWrite);
     if (s_out == nullptr) {
       closeSession("no stdout for the socket");
       return;
@@ -264,6 +306,9 @@ static void dispatch() {
   if (len > 0) {
     runCommand(s_line);
   }
+  if (s_clientDead) {
+    closeSession("client stopped reading");
+  }
 }
 
 static void pump() {
@@ -315,14 +360,21 @@ static int openListener() {
 // debugging session nobody is watching.
 static void listenTask(void *) {
   int listenFd = -1;
+  bool complained = false;
   while (!s_stopWanted) {
     if (listenFd < 0) {
       listenFd = openListener();
       if (listenFd < 0) {
-        ESP_LOGW(TAG, "port %u not available, retrying", PORT);
+        // Once, not once a second: a port that stays unavailable would otherwise
+        // bury every other line in the log.
+        if (!complained) {
+          ESP_LOGW(TAG, "port %u not available (errno %d), retrying quietly", PORT, errno);
+          complained = true;
+        }
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
         continue;
       }
+      complained = false;
       ESP_LOGI(TAG, "listening on port %u", PORT);
     }
 
@@ -348,13 +400,17 @@ static void listenTask(void *) {
     }
     if (FD_ISSET(listenFd, &readable)) {
       int fd = accept(listenFd, nullptr, nullptr);
-      if (fd >= 0) {
-        if (s_fd >= 0) {
-          send(fd, "BUSY\n", 5, 0);
-          close(fd);
-        } else {
-          openSession(fd);
-        }
+      if (fd < 0) {
+        // Ten sockets between here and everything Matter wants, so running out
+        // is the plausible failure. The pending connection stays queued and
+        // keeps select() firing, hence the pause as well as the complaint.
+        ESP_LOGW(TAG, "accept failed (errno %d)", errno);
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+      } else if (s_fd >= 0) {
+        send(fd, "BUSY\n", 5, 0);
+        close(fd);
+      } else {
+        openSession(fd);
       }
     }
   }
@@ -368,9 +424,12 @@ static void listenTask(void *) {
   vTaskDelete(nullptr);
 }
 
-static void startListener() {
+// False means the caller must not claim the console is up: a task still on its
+// way out still owns the port, and silently reusing it would report a listener
+// that is about to delete itself.
+static bool startListener() {
   if (s_task != nullptr) {
-    return;
+    return !s_stopWanted;
   }
   s_stopWanted = false;
   // `add` builds a Matter endpoint on whichever task runs it, which is why the
@@ -378,18 +437,22 @@ static void startListener() {
   TaskHandle_t created = nullptr;
   xTaskCreate(listenTask, "netconsole", 8192, nullptr, 2, &created);
   s_task = created;
+  return s_task != nullptr;
 }
 
-static void stopListener() {
+// Waits it out so the command does not return before the port is free, which is
+// the only way "the listener is gone" can be checked from the next line. The
+// wait comfortably outlasts the one send timeout a wedged client can cost, so a
+// false here means something is genuinely stuck and the caller has to say so.
+static bool stopListener() {
   if (s_task == nullptr) {
-    return;
+    return true;
   }
   s_stopWanted = true;
-  // Waits it out so the command does not return before the port is free, which
-  // is the only way "the listener is gone" can be checked from the next line.
-  for (int i = 0; i < 50 && s_task != nullptr; i++) {
+  for (uint32_t waited = 0; waited < STOP_WAIT_MS && s_task != nullptr; waited += 100) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
+  return s_task == nullptr;
 }
 
 // The session task runs commands too, so this is the one command that has to
@@ -407,7 +470,10 @@ static int cmdPasswd(int argc, char **argv) {
   if (strcmp(argv[1], "clear") == 0) {
     nvs_erase_key(s_nvs, SECRET_KEY);
     nvs_commit(s_nvs);
-    stopListener();
+    if (!stopListener()) {
+      printf("PASSWD cleared, but the listener has not let go of port %u\n", PORT);
+      return 1;
+    }
     printf("PASSWD cleared\n");
     return 0;
   }
@@ -420,7 +486,10 @@ static int cmdPasswd(int argc, char **argv) {
     printf("ERR secret not stored\n");
     return 1;
   }
-  startListener();
+  if (!startListener()) {
+    printf("PASSWD set, but the previous listener is still shutting down\n");
+    return 1;
+  }
   printf("PASSWD set, console on port %u\n", PORT);
   return 0;
 }

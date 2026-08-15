@@ -184,7 +184,7 @@ light-sleeping, with `battlog` filling up. The same commands are therefore
 reachable over TCP on port 5323, behind a shared secret set over USB:
 
 ```
-genie> passwd correct-horse-battery
+genie> passwd <your-secret>
 PASSWD set, console on port 5323
 ```
 
@@ -208,7 +208,10 @@ home-LAN debugging tool, not something to put in front of the internet.
 While a session is up the log stream is teed to it, so a `DIAG` line or a
 driver warning appears in the client as it happens. The tee runs on whichever
 task logged, so it never blocks: a socket that will not take the bytes loses
-log lines instead, and the count is reported on disconnect.
+log lines instead. The count comes back in the `BYE` line — which a client
+that vanishes without closing cleanly never gets to read. A client that stops
+reading altogether is dropped after one ten-second send timeout, rather than
+being allowed to park the console for as long as it likes.
 
 ## Verifying the screen without eyes
 
