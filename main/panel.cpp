@@ -69,6 +69,13 @@ static void releaseResets() {
   vTaskDelay(pdMS_TO_TICKS(20));
 }
 
+// The same three bits low: DSI_PWR_EN cuts VCI to the module, and the two reset
+// lines go with it so the controller and the digitiser sit in their defined
+// state while unpowered rather than being fed through their protection diodes.
+static void cutPower() {
+  ESP_ERROR_CHECK_WITHOUT_ABORT(i2cWriteReg(s_tca, 0x01, 0x00));
+}
+
 // The controller reports nothing until its interrupt mode is configured — 0xFA
 // bit 4 (motion) is what Arduino_DriveBus writes, and it is the difference
 // between frozen coordinate registers and a working digitiser. The chip also
@@ -92,6 +99,16 @@ static bool onFlushDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t
   BaseType_t woken = pdFALSE;
   xSemaphoreGiveFromISR(s_flushDone, &woken);
   return woken == pdTRUE;
+}
+
+// Everything the CO5300 forgets when VCI goes: SWRESET, MADCTL/COLMOD, the
+// vendor sequence (SLPOUT among it) and DISPON. Roughly 180 ms of mandated
+// delays, which is most of what panelWake() costs.
+static void initController() {
+  ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+  ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, CO5300_COL_OFFSET, 0));
+  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 }
 
 static void displayInit() {
@@ -127,10 +144,7 @@ static void displayInit() {
   device.vendor_config = &vendor;
   ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(s_io, &device, &s_panel));
 
-  ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
-  ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-  ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, CO5300_COL_OFFSET, 0));
-  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
+  initController();
 }
 
 static void registerCommands();
@@ -160,7 +174,15 @@ bool panelInit() {
   return true;
 }
 
+// Asleep now means unpowered, so this and panelFlush() are where every caller's
+// drawing stops: gfx writes reach PSRAM as they always did, and nothing reaches
+// a module whose VCI is off. Guarding the two functions that talk to the wire
+// covers pollState(), builderNeedsRedraw() and the Matter backlight endpoint at
+// once, which guarding each caller would not.
 void panelBrightness(uint8_t level) {
+  if (s_asleep) {
+    return;
+  }
   // The component's own setter takes 0-100 and logs at INFO on every call; the
   // register is the 0-255 scale the rest of the firmware works in.
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(s_io, QSPI_CMD_BRIGHTNESS, &level, 1));
@@ -170,27 +192,51 @@ bool panelAsleep() {
   return s_asleep;
 }
 
-// Deliberately no disp_on_off(false): it issues SLPIN, and the CST816 shares
-// this display module's power domain, so sleeping the panel controller kills
-// touch and nothing can wake us again. Blanking the framebuffer is the real
-// saving anyway — an AMOLED's black pixels are simply unlit.
+// Brightness 0 is not off: the CO5300 keeps its charge pump running for
+// ELVDD/ELVSS whatever it is showing, and this firmware used to leave DSI_PWR_EN
+// high for the device's whole life. Cutting VCI is worth tens of mA — the
+// larger half of the shelf drain (see the README's power section).
+//
+// DISPOFF first so the panel stops driving pixels before its supply is pulled;
+// the settle is for the module's own decoupling to bleed down. SLPIN was
+// considered and rejected: the driver's disp_on_off only sends DISPOFF, so
+// SLPIN would be a raw QSPI command, and it saves nothing once VCI is gone and
+// the reset lines are low.
+//
+// ponytail: the CST816 shares this rail, so touch dies with the panel and the
+// PWR key is the only wake. Task #22 (wake on touch) would have to either keep
+// the rail up — which is most of this saving — or open a timed window; both
+// start from cutPower()/releaseResets() being the only pair that moves it.
 void panelSleep() {
   if (s_asleep) {
     return;
   }
   gfxFillScreen(COL_BLACK);
-  panelFlush();
   panelBrightness(0);
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, false));
+  vTaskDelay(pdMS_TO_TICKS(20));
+  cutPower();
   s_asleep = true;
 }
 
-// The caller redraws; the framebuffer was blanked on the way down.
+// A full cold start of the module, because that is what it now is. The black
+// framebuffer goes out before the brightness comes up so the first lit frame is
+// not whatever the GRAM powered up holding; the caller then redraws. Touch is
+// initialised last: it costs the longest and nobody can tap a screen they
+// cannot see yet.
 void panelWake() {
   if (!s_asleep) {
     return;
   }
-  panelBrightness(PANEL_ON_BRIGHTNESS);
+  int64_t startedAt = esp_timer_get_time();
+  releaseResets();
+  initController();
   s_asleep = false;
+  panelBrightness(0);
+  panelFlush();
+  panelBrightness(PANEL_ON_BRIGHTNESS);
+  touchInit();
+  ESP_LOGI(TAG, "panel wake took %u ms", (unsigned)((esp_timer_get_time() - startedAt) / 1000));
 }
 
 // The ui task is the only task that may be inside this, panelSleep(),
@@ -219,6 +265,9 @@ void panelWake() {
 // ~18 ms flush instead of leaving a garbled band that stands until the screen
 // next changes, which on a screen that has gone quiet could be a long time.
 void panelFlush() {
+  if (s_asleep) {
+    return;
+  }
   int64_t startedAt = esp_timer_get_time();
   // Exactly two attempts: a retry that underflows too would only be a third
   // chance at the same odds, and the ui task has a watchdog to answer to.
@@ -293,6 +342,9 @@ void panelTouchDump(uint32_t durationMs) {
 }
 
 bool panelTouch(int16_t *x, int16_t *y) {
+  if (s_asleep) {
+    return false;
+  }
   uint8_t report[5];
   if (i2cReadReg(s_touch, 0x02, report, sizeof(report)) != ESP_OK) {
     return false;

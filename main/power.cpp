@@ -6,6 +6,7 @@
 #include <strings.h>
 
 #include "esp_pm.h"
+#include "esp_private/wifi.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs.h"
@@ -19,6 +20,22 @@
 // router's DTIM beacon, which adds a beat of latency to anything Home sends —
 // drop to "min" if that ever grates.
 static const wifi_ps_type_t DEFAULT_PS = WIFI_PS_MAX_MODEM;
+
+// Every time the station goes active it holds APB at 80 MHz — which blocks
+// light sleep outright — for at least this long, refreshed by any packet either
+// way. It looks like the obvious lever on the `wifi` lock's 25% residency, and
+// it is not: four interleaved four-minute windows with the screen asleep and
+// `usbsim on` put 50 ms at 26.7/24.9% and the driver's 8 ms floor at 25.5/27.4%
+// — no effect outside the window-to-window spread. So this stays at IDF's own
+// default and `power active <ms>` is left as the instrument that says so; the
+// holds are the radio's traffic-driven active windows, not this tail.
+static const uint32_t DEFAULT_MIN_ACTIVE_MS = 50;
+static uint32_t s_minActiveMs = DEFAULT_MIN_ACTIVE_MS;
+
+static void setMinActive(uint32_t ms) {
+  s_minActiveMs = ms;
+  esp_wifi_set_sleep_min_active_time(ms * 1000);
+}
 
 // The screen is dark for almost all of the device's life, and nothing that runs
 // in the dark needs more than WiFi's floor. Under DFS these are the ends of the
@@ -136,11 +153,11 @@ static void report() {
   esp_pm_get_configuration(&pm);
   wifi_mode_t mode = WIFI_MODE_NULL;
   esp_wifi_get_mode(&mode);
-  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d usbsim=%d wifi_ps=%s wifi_mode=%s "
-         "flush=%.1fms underflows=%u\n",
+  printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d usbsim=%d wifi_ps=%s active=%ums "
+         "wifi_mode=%s flush=%.1fms underflows=%u\n",
          pm.min_freq_mhz, pm.max_freq_mhz, pm.light_sleep_enable ? 1 : 0, s_awakeHeld ? 1 : 0,
-         s_pretendBattery ? 1 : 0, psName(ps), modeName(mode), panelLastFlushUs() / 1000.0,
-         (unsigned)panelUnderflows());
+         s_pretendBattery ? 1 : 0, psName(ps), (unsigned)s_minActiveMs, modeName(mode),
+         panelLastFlushUs() / 1000.0, (unsigned)panelUnderflows());
   pmuReport();
 }
 
@@ -186,6 +203,15 @@ static int cmdPower(int argc, char **argv) {
     report();
     return 0;
   }
+  if (strcasecmp(argv[1], "active") == 0) {
+    if (argc != 3) {
+      printf("ERR usage: power active <ms>\n");
+      return 1;
+    }
+    setMinActive((uint32_t)strtoul(argv[2], nullptr, 10));
+    report();
+    return 0;
+  }
 
   const char *arg = argc == 2 ? argv[1] : "";
   long fixed = strtol(arg, nullptr, 10);
@@ -206,7 +232,8 @@ static int cmdPower(int argc, char **argv) {
   } else if (fixed == 80 || fixed == 160 || fixed == 240) {
     configure((int)fixed, (int)fixed, false);
   } else {
-    printf("ERR usage: power [locks|timers|rails|on|off|80|160|240|usbsim <on|off>]\n");
+    printf("ERR usage: power [locks|timers|rails|on|off|80|160|240|active <ms>|usbsim "
+           "<on|off>]\n");
     return 1;
   }
   report();
@@ -244,6 +271,7 @@ void powerBegin() {
   uint8_t ps = (uint8_t)DEFAULT_PS;
   nvs_get_u8(s_nvs, PS_KEY, &ps);
   esp_wifi_set_ps((wifi_ps_type_t)ps);
+  setMinActive(DEFAULT_MIN_ACTIVE_MS);
 
   size_t stored = sizeof(s_log);
   if (nvs_get_blob(s_nvs, LOG_KEY, s_log, &stored) != ESP_OK || stored != sizeof(s_log)) {
@@ -256,8 +284,8 @@ void powerBegin() {
   consoleRegisterCmd("power",
                      "Show power state; 'locks' dumps PM locks and sleep stats, 'timers' dumps "
                      "esp_timer, 'rails' the PMU regulators, 'on' restores DFS and light sleep, "
-                     "'off'|'80'|'160'|'240' pin the clock instead, 'usbsim on|off' fakes the "
-                     "cable being out (debug)",
+                     "'off'|'80'|'160'|'240' pin the clock instead, 'active <ms>' sets the WiFi "
+                     "minimum active time, 'usbsim on|off' fakes the cable being out (debug)",
                      cmdPower);
   consoleRegisterCmd("ps", "Set WiFi power save: none | min | max", cmdPs);
   consoleRegisterCmd("battlog", "Dump the battery drain log, oldest first", cmdBattlog);

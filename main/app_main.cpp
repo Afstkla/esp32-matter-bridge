@@ -270,11 +270,16 @@ static void pollRequests() {
 
 // The screen shows both, and neither raises anything the ui task hears about.
 // Half a second is the same cadence the Arduino build polled the stack at.
+//
+// Nothing to poll for while the screen is off: the panel is unpowered, the
+// redraw this would trigger goes nowhere, and every wake path redraws anyway.
+// netStatus() is a WiFi API call, so this is also the one place the ui task
+// touches the radio on a fixed cadence.
 static void pollState() {
   static uint32_t lastAt = 0;
   static bool lastCommissioned = false;
   static bool lastOnline = false;
-  if (nowMs() - lastAt < 500) {
+  if (panelAsleep() || nowMs() - lastAt < 500) {
     return;
   }
   lastAt = nowMs();
@@ -295,12 +300,11 @@ static void pollState() {
 // A dark screen is the device's normal state, and there is nothing to look at
 // between ticks: dropping to four passes a second is what lets tickless idle
 // find a sleep worth taking. The cost is anything shorter than a tick: a quick
-// tap, or a quick BOOT press, can fall between two polls, so waking the screen
-// sometimes takes a second try. The power key is exempt — its PMU interrupt
-// latches, so a press waits for whenever the poll gets there.
-//
-// The CST816's INT reaches GPIO21 (active low, 10K pull-up) and would turn the
-// touch half of that into an interrupt; wiring it up is its own job.
+// BOOT press can fall between two polls, so waking the screen sometimes takes a
+// second try. The power key is exempt — its PMU interrupt latches, so a press
+// waits for whenever the poll gets there, and it is the wake to use: the
+// digitiser is unpowered with the panel (see panelSleep), so touch cannot wake
+// the device at all.
 static const uint32_t TICK_AWAKE_MS = 20;
 static const uint32_t TICK_ASLEEP_MS = 250;
 

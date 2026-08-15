@@ -105,7 +105,9 @@ accessory is uncertified — this firmware uses the Matter **test** vendor ID
   legal in Matter but miserable to tell apart in the Home app. The chosen name
   is pushed to the accessory's `NodeLabel`, so it reaches Home too.
 - **remove** — top right of an accessory's screen, then tap again to confirm.
-- The screen sleeps after a minute and wakes on touch.
+- The screen sleeps after a minute and wakes on the **PWR** key. Not on touch:
+  sleeping cuts the display module's supply, and the digitiser shares it (see
+  the power model).
 
 Taps register on release, which is what makes a swipe distinguishable from a
 tap. A press that drifts more than ~24 px is treated as neither.
@@ -158,7 +160,7 @@ port at a time.
 | `swipe left\|right` | change page, animation included |
 | `tap X Y` | inject a tap at a coordinate |
 | `bright 0-255` | set panel brightness |
-| `sleep` / `wake` | blank / unblank and redraw the screen |
+| `sleep` / `wake` | power the display module down / back up and redraw |
 | `qr` | toggle the pairing screen |
 | `idle N` | blank the screen after N seconds, 0 to never |
 | `reset slots` | remove every accessory (restarts) |
@@ -282,6 +284,34 @@ Latency to the device is now DTIM-paced — 85–595 ms round-trip, against a fe
 ms when the radio never slept. That is the new normal and what modem sleep
 costs; `ps min` is the runtime escape hatch if it ever grates.
 
+The `wifi` `APB_FREQ_MAX` lock is held for about a quarter of wall clock even
+with the screen off — roughly 3.1 acquisitions a second, ~80 ms each — and that
+is what keeps the chip's sleep-permitted share near 70% instead of 95%. It is
+the radio's own traffic-driven active windows, not anything this firmware polls:
+IDF's **minimum active time** looks like the lever and measurably is not (four
+interleaved four-minute windows, 50 ms → 26.7/24.9%, the 8 ms floor →
+25.5/27.4%), so it is left at the stock 50 ms. `power active <ms>` retunes it
+live and `power` reports `active=`; it is kept as the instrument that settles
+that question, not as a setting anyone needs to touch.
+
+**Screen sleep powers the display module down.** Brightness 0 is not off: the
+CO5300 keeps its charge pump running for ELVDD/ELVSS whatever it is showing, and
+this firmware used to leave `DSI_PWR_EN` asserted for the device's whole life —
+`DCDC1` 3.3 V → `VCC3V3` → `DSI_PWR_EN` on the TCA9554 → `VCI` → panel. Sleeping
+now sends DISPOFF and then drops that expander bit, and waking is a cold start of
+the module: reset pulse, full CO5300 init, a black frame, then the backlight.
+
+Two consequences, both deliberate:
+
+- **Waking takes ~260 ms** (measured; the CO5300's own init delays are most of
+  it, and `panel wake took N ms` is logged on every wake) instead of the one
+  register write it used to be.
+- **Touch cannot wake the device.** The CST816 sits on the same `VCI` domain, so
+  it is unpowered while the screen is off — `touchdump` answers `DUMP read
+  failed`, which is the check that the rail is really down. The **PWR** key is
+  the wake: its PMU interrupt latches, so a press is never missed. Keeping touch
+  alive would mean keeping the rail up, which is most of the saving.
+
 Battery percent is interpolated from a resting LiPo OCV table, not from the
 AXP2101's fuel gauge, which has no battery model programmed and reported 52% at
 3.58 V on a cell that died half an hour later. The table is only honest at
@@ -295,8 +325,9 @@ minutes (`mv`/`pct`/`flags` with USB/charging/boot bits), giving a rolling
 24-hour window. It survives reboots and dumps oldest-first. Entries older than
 this change carry the fuel gauge's numbers and are not comparable.
 
-`power` (debug surface) reports the live PM config, WiFi PS mode, last flush
-time and PMU reading; `power locks` dumps the PM lock table; `power
+`power` (debug surface) reports the live PM config, WiFi PS mode and minimum
+active time, last flush time and PMU reading; `power locks` dumps the PM lock
+table; `power active <ms>` retunes the WiFi minimum active time; `power
 80|160|240` pins the clock for testing and `power off` disables light sleep
 entirely, falling back to the fixed 240 MHz clock — the escape hatch if the
 panel path ever misbehaves under DFS again.
