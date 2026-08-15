@@ -54,30 +54,9 @@ struct CommissioningStage {
   uint8_t fabrics;
 };
 
-// Takes the stack lock only when it is both needed and not already held: the
-// CHIP task holds it whenever it calls into us and the mutex is not recursive,
-// and before esp_matter::start() there is no CHIP task to race with. Same guard
-// esp_matter's own ScopedChipStackLock uses.
-namespace {
-class StackLock {
-public:
-  StackLock()
-      : _taken(esp_matter::is_started() &&
-               !chip::DeviceLayer::PlatformMgr().IsChipStackLockedByCurrentThread()) {
-    if (_taken) {
-      chip::DeviceLayer::PlatformMgr().LockChipStack();
-    }
-  }
-  ~StackLock() {
-    if (_taken) {
-      chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-    }
-  }
-
-private:
-  bool _taken;
-};
-}  // namespace
+// The snapshot bridgeCommissioned() and bridgePairingWindowOpen() answer from.
+// Written by the CHIP task, read by the ui task on every redraw.
+static CommissioningStage s_stage{};
 
 static CommissioningStage readStage() {
   CommissioningStage s{};
@@ -103,14 +82,11 @@ static void printStage(const CommissioningStage &s) {
 // to poll from. Every hand-off worth watching raises a stack event, so the
 // callback that was empty there does the same job here for nothing.
 static void eventCb(const ChipDeviceEvent *event, intptr_t arg) {
-  static CommissioningStage previous{};
-  static bool seeded = false;
   CommissioningStage now = readStage();
-  if (seeded && memcmp(&now, &previous, sizeof(now)) == 0) {
+  if (memcmp(&now, &s_stage, sizeof(now)) == 0) {
     return;
   }
-  seeded = true;
-  previous = now;
+  s_stage = now;
   printStage(now);
 }
 
@@ -144,24 +120,26 @@ static const uint32_t PAIRING_WINDOW_SECONDS = 180;
 // window, no BLE — so its pairing code is unusable unless something asks for a
 // window first.
 void bridgeOpenPairingWindow() {
-  StackLock lock;
-  auto &manager = chip::Server::GetInstance().GetCommissioningWindowManager();
-  if (manager.IsCommissioningWindowOpen()) {
-    return;
+  CHIP_ERROR err = CHIP_NO_ERROR;
+  {
+    StackLock lock;
+    auto &manager = chip::Server::GetInstance().GetCommissioningWindowManager();
+    if (manager.IsCommissioningWindowOpen()) {
+      return;
+    }
+    err =
+        manager.OpenBasicCommissioningWindow(chip::System::Clock::Seconds32(PAIRING_WINDOW_SECONDS));
   }
-  CHIP_ERROR err =
-      manager.OpenBasicCommissioningWindow(chip::System::Clock::Seconds32(PAIRING_WINDOW_SECONDS));
+  s_stage.windowOpen = err == CHIP_NO_ERROR;
   printf("WINDOW %s\n", err == CHIP_NO_ERROR ? "open" : "failed");
 }
 
 bool bridgePairingWindowOpen() {
-  StackLock lock;
-  return chip::Server::GetInstance().GetCommissioningWindowManager().IsCommissioningWindowOpen();
+  return s_stage.windowOpen;
 }
 
 bool bridgeCommissioned() {
-  StackLock lock;
-  return chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+  return s_stage.fabrics > 0;
 }
 
 // The raw "MT:..." payload, which is what Apple Home scans. The URL wrapper the
@@ -247,6 +225,12 @@ bool bridgeStart() {
     ESP_LOGE(TAG, "esp_matter start failed (%d)", err);
     return false;
   }
+
+  {
+    StackLock lock;
+    s_stage = readStage();
+  }
+  printStage(s_stage);
 
   consoleRegisterCmd("diag", "Show commissioning stage, network and heap", cmdDiag);
   consoleRegisterCmd("state", "Report whether the device holds a fabric", cmdState);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <esp_matter.h>
+#include <platform/CHIPDeviceLayer.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,29 @@ private:
   uint16_t _endpointId = 0;
 };
 
+// Takes the stack lock only when it is both needed and not already held: the
+// CHIP task holds it whenever it calls into us and the mutex is not recursive,
+// and before esp_matter::start() there is no CHIP task to race with. Same guard
+// esp_matter's own ScopedChipStackLock uses.
+class StackLock {
+public:
+  StackLock()
+      : _taken(esp_matter::is_started() &&
+               !chip::DeviceLayer::PlatformMgr().IsChipStackLockedByCurrentThread()) {
+    if (_taken) {
+      chip::DeviceLayer::PlatformMgr().LockChipStack();
+    }
+  }
+  ~StackLock() {
+    if (_taken) {
+      chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    }
+  }
+
+private:
+  bool _taken;
+};
+
 // Accessories are exposed as bridged nodes under a Matter Aggregator rather
 // than as plain endpoints on the root node. That is the only arrangement in
 // which an ecosystem reads a per-accessory name (NodeLabel on the Bridged
@@ -59,15 +83,18 @@ bool bridgePublish(esp_matter::endpoint_t *endpoint);
 // every cluster rather than anything the accessory uses.
 void bridgeCount(esp_matter::endpoint_t *endpoint, uint16_t *clusters, uint16_t *attributes);
 
-// True once the device holds at least one fabric.
+// Both answer from the snapshot the stack's event callback keeps up to date,
+// not from the stack itself. The ui task asks on every redraw and
+// LockChipStack has no timeout, so a commissioning handshake holding it would
+// stall the screen for as long as it ran.
 bool bridgeCommissioned();
+bool bridgePairingWindowOpen();
 
 // The pairing screen's material. The payload is the raw "MT:..." string Apple
 // Home scans; the code is the 11 digits underneath it.
 bool bridgePairingPayload(char *out, size_t size);
 bool bridgePairingCode(char *out, size_t size);
 
-bool bridgePairingWindowOpen();
 void bridgeOpenPairingWindow();
 
 // The Matter device types this bridge can expose, in the order the picker

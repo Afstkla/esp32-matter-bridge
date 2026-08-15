@@ -285,17 +285,14 @@ void builderDescribe(uint8_t slot, char *out, size_t n) {
   }
 }
 
+// Records the id the stack handed back but does not persist it: the caller
+// knows whether it is writing the slot blob anyway.
 static bool startAccessory(uint8_t slot) {
-  uint16_t wanted = s_slot[slot].endpointId;
-  if (!s_accessory[slot].begin(s_slot[slot].type, builderLabel(slot), wanted)) {
+  if (!s_accessory[slot].begin(s_slot[slot].type, builderLabel(slot), s_slot[slot].endpointId)) {
     return false;
   }
 
-  uint16_t assigned = s_accessory[slot].getEndPointId();
-  if (assigned != wanted) {
-    s_slot[slot].endpointId = assigned;
-    persistSlots();
-  }
+  s_slot[slot].endpointId = s_accessory[slot].getEndPointId();
 
   // Only the controllable types report back. A sensor is driven from this end,
   // and a button carries no state a controller could write.
@@ -343,10 +340,17 @@ void builderBegin() {
 // stack's counter restored from NVS first, so accessories cannot come up with
 // the node.
 void builderResume() {
+  bool moved = false;
   for (uint8_t slot = 0; slot < s_count; slot++) {
-    if (builderSlotUsed(slot)) {
-      startAccessory(slot);
+    if (!builderSlotUsed(slot)) {
+      continue;
     }
+    uint16_t wanted = s_slot[slot].endpointId;
+    startAccessory(slot);
+    moved = moved || s_slot[slot].endpointId != wanted;
+  }
+  if (moved) {
+    persistSlots();
   }
 }
 
