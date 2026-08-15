@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include <app-common/zap-generated/cluster-enums.h>
+#include <app/clusters/power-source-server/power-source-server.h>
 #include <esp_matter.h>
 #include <platform/CHIPDeviceLayer.h>
 
@@ -173,9 +174,12 @@ static uint8_t batteryChargeLevel(uint8_t percent) {
   return (uint8_t)PowerSource::BatChargeLevelEnum::kOk;
 }
 
-// The battery lives on the parent, not on a child of its own: Bridged Node
-// carries Power Source as an optional server cluster, which is how a bridge
-// says "this accessory runs on a battery" rather than inventing an endpoint.
+// The battery lives on the parent, not on a child of its own. Core spec
+// 9.12.2.3: a bridged device whose whole self runs off one source SHALL carry
+// the cluster "on the endpoint where the Bridged Node device type is located",
+// and every endpoint carrying the cluster "SHALL have the related Power Source
+// device type in its DeviceTypeList" — so the parent answers for two device
+// types, 0x0013 and 0x0011. endpoint::power_source::add does both halves.
 //
 // The Battery feature is what makes BatChargeLevel, BatReplacementNeeded and
 // BatReplaceability mandatory; with Status, Order, Description and
@@ -184,24 +188,68 @@ static uint8_t batteryChargeLevel(uint8_t percent) {
 // is how an accessory ends up unsupported. BatPercentRemaining is optional and
 // is the only number Home actually draws, so it is added by hand.
 static void addBattery(endpoint_t *parent, const PmuStatus &pmu) {
-  cluster::power_source::config_t config;
-  config.feature_flags = cluster::power_source::feature::battery::get_id();
-  config.status = (uint8_t)PowerSource::PowerSourceStatusEnum::kActive;
-  strlcpy(config.description, "Battery", sizeof(config.description));
-  config.features.battery.bat_charge_level = batteryChargeLevel(pmu.percent);
+  endpoint::power_source::config_t config;
+  cluster::power_source::config_t &source = config.power_source;
+  source.feature_flags = cluster::power_source::feature::battery::get_id();
+  source.status = (uint8_t)PowerSource::PowerSourceStatusEnum::kActive;
+  strlcpy(source.description, "Battery", sizeof(source.description));
+  source.features.battery.bat_charge_level = batteryChargeLevel(pmu.percent);
   // Not UserReplaceable: the Replaceable feature would come with it and bring
   // its own mandatory attributes describing a cell nobody is meant to swap.
-  config.features.battery.bat_replaceability =
+  source.features.battery.bat_replaceability =
       (uint8_t)PowerSource::BatReplaceabilityEnum::kNotReplaceable;
 
-  cluster_t *cluster = cluster::power_source::create(parent, &config, CLUSTER_FLAG_SERVER);
+  if (endpoint::power_source::add(parent, &config) != ESP_OK) {
+    ESP_LOGE(TAG, "power source add failed");
+    return;
+  }
+  cluster_t *cluster = cluster::get(parent, PowerSource::Id);
   if (cluster == nullptr) {
-    ESP_LOGE(TAG, "power source create failed");
+    ESP_LOGE(TAG, "power source cluster missing after add");
     return;
   }
   cluster::power_source::attribute::create_bat_percent_remaining(
       cluster, nullable<uint8_t>(batteryHalfPercent(pmu.percent)), nullable<uint8_t>(0),
       nullable<uint8_t>(200));
+}
+
+// EndpointList is not optional and empty is not neutral: spec 11.7.7.32 says
+// an empty list SHALL mean the source powers the entire node, which on a
+// bridge would claim this cell also runs every simulated accessory. 9.12.2.3
+// wants "all the endpoints constituting the Bridged Device", and 11.7.7.32
+// wants the endpoint the cluster sits on to appear in its own list, so the
+// parent is in there alongside its children.
+//
+// Written once, after the children are numbered and the parent is enabled —
+// both are preconditions. The set never changes afterwards: these endpoints
+// are built at boot from the persisted ids and none is added at runtime.
+//
+// The list is MANAGED_INTERNALLY, so attribute::update cannot reach it; the
+// AAI answers it from PowerSourceServer, which copies the span.
+static void linkBatteryEndpoints() {
+  chip::EndpointId powered[3] = {};
+  size_t count = 0;
+  for (uint16_t id : {s_ids.parent, s_ids.temperature, s_ids.backlight}) {
+    if (id != 0) {
+      powered[count++] = id;
+    }
+  }
+  StackLock lock;
+  if (PowerSourceServer::Instance().SetEndpointList(
+          s_ids.parent, chip::Span<chip::EndpointId>(powered, count)) != CHIP_NO_ERROR) {
+    ESP_LOGE(TAG, "power source endpoint list failed");
+    return;
+  }
+  // What a controller is handed, not what esp_matter stored: the AAI answers
+  // ClusterRevision from CHIP's own constant, so a submodule bump that moves
+  // one and not the other shows up here rather than silently.
+  esp_matter_attr_val_t revision = esp_matter_invalid(nullptr);
+  attribute_t *attribute = attribute::get(s_ids.parent, PowerSource::Id,
+                                          Globals::Attributes::ClusterRevision::Id);
+  if (attribute::get_val(attribute, &revision) == ESP_OK) {
+    ESP_LOGI(TAG, "power source on endpoint %u serves revision %u, %u powered endpoints",
+             s_ids.parent, (unsigned)revision.val.u16, (unsigned)count);
+  }
 }
 
 static void report(const char *what, endpoint_t *endpoint) {
@@ -305,6 +353,7 @@ void internalsBegin() {
     s_backlight.setEndPointId(s_ids.backlight);
   }
   persistIds();
+  linkBatteryEndpoints();
 }
 
 static void publishValue(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId,

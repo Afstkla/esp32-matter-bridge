@@ -310,12 +310,17 @@ thing. Apple Home draws it as a single tile. Inside are the PMU die
 temperature and the display brightness, which really does dim the panel.
 
 The battery is not a child endpoint. It is a **Power Source** cluster on the
-parent itself — Bridged Node carries that cluster as an optional server, which
-is Matter's way of saying "this accessory runs on a battery". Home reads it and
-shows the level in the accessory's details, with the usual low-battery
-notification once `BatChargeLevel` leaves `Ok`; the cuts are 20% for a warning
-and 7% for critical, on the OCV-derived percent whose caveats are above.
-`BatPercentRemaining` is in half-percents, so a full cell reads 200.
+parent itself, which is where the spec puts it for a composed bridged device
+powered by one cell — so the parent answers for two device types, Bridged Node
+and Power Source, and the cluster's `EndpointList` names the three endpoints
+that cell actually powers. Leaving that list empty would not have meant
+"unspecified": it means "this source powers the whole node", which on a bridge
+would have claimed the Genie's battery runs every simulated accessory too.
+
+Home reads it and shows the level in the accessory's details, with the usual
+low-battery notification once `BatChargeLevel` leaves `Ok`; the cuts are 20%
+for a warning and 7% for critical, on the OCV-derived percent whose caveats are
+above. `BatPercentRemaining` is in half-percents, so a full cell reads 200.
 
 It used to be a **humidity** child, because Home was assumed not to read Power
 Source. It does, so that child is gone. Home drops the stale tile on its own,

@@ -344,7 +344,49 @@ there fails silently too.
 One consequence to keep in mind: `ClusterRevision` on this cluster is answered
 by the AAI from CHIP's `PowerSource::kRevision`, so the revision esp_matter
 stored is never read by anyone. They agree at 3 here, but a future submodule
-bump could part them and nothing would say so.
+bump could part them and nothing would say so, so `internals` logs the served
+number at boot.
+
+## An empty EndpointList is a claim, not a blank
+
+Power Source has one attribute whose default is actively wrong, and it is
+mandatory, so it ships whether or not you think about it. `EndpointList` is
+created empty by `cluster::power_source::create` and the spec gives that a
+meaning (core spec 11.7.7.32):
+
+> A cluster instance with an empty list SHALL indicate that the power source is
+> for the entire node, which includes all endpoints.
+
+On a bridge that is a lie with consequences: it says the one physical cell
+powers every simulated accessory on the node. The same section requires that
+> A cluster instance with a non-empty list SHALL include the endpoint, upon
+> which the cluster instance resides.
+
+and the bridge chapter (9.12.2.3) is explicit about the composed case:
+
+> In case this power source provides power to the entire Bridged Device, the
+> power source cluster SHALL be on the endpoint where the Bridged Node device
+> type is located, and contain an EndpointList attribute containing all the
+> endpoints constituting the Bridged Device.
+
+Two more traps in the same paragraph:
+
+- **The endpoint needs the Power Source device type too.** "Each endpoint with
+  a Power Source cluster SHALL have the related Power Source device type in its
+  DeviceTypeList." So the parent answers `0x0013` *and* `0x0011`.
+  `endpoint::power_source::add()` does both halves — device type and cluster —
+  which is why it is worth using over a bare `cluster::power_source::create()`.
+- **The list cannot be written with `attribute::update()`.** It is
+  `ATTRIBUTE_FLAG_MANAGED_INTERNALLY`, which `set_val_internal` refuses
+  outright. It is served by the AAI out of `PowerSourceServer`, so
+  `PowerSourceServer::Instance().SetEndpointList(endpointId, span)` is the only
+  way in. That call copies the span, and it needs the endpoint enabled — it
+  resolves its slot through `emberAfGetClusterServerEndpointIndex`, which walks
+  the node's endpoint list.
+
+`walk` cannot show any of this: `attribute::get_val` refuses arrays, so the
+list prints as a bare `0x001F` whether it holds three endpoints or none. A
+controller read is the only way to see it.
 
 To see what a controller would get, use `walk`: `attribute::get_val()` reads
 back through the provider, so it shows the object's value, not the store's.
