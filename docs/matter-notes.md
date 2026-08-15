@@ -248,6 +248,83 @@ Traps:
   it (`CHIP_STACK_LOCK_TRACKING_ENABLED` is on in these libs). Calling it from
   inside your own lock is safe; without that tracking it would deadlock.
 
+## `<type>::add()` does not create the Descriptor cluster
+
+`<type>::create()` is a wrapper: `endpoint::create()`, then
+`descriptor::create()`, then `<type>::add()`. Only the wrapper adds the
+Descriptor — `add()` never does, and neither does `endpoint::create()` or
+`endpoint::resume()`, which allocate an endpoint with no clusters at all.
+`bridged_node::resume()` re-creates the descriptor by hand for exactly this
+reason.
+
+So an endpoint built as `endpoint::create()` + `<type>::add()` — the shape you
+need when the endpoint id has to be reclaimed from NVS — serves **no
+Descriptor**. That is not cosmetic. Every endpoint shall have one (core spec
+§9.5); it carries `DeviceTypeList`, `ServerList` and `PartsList`, the provider
+builds `ServerClusters()` straight from the cluster list, and the Descriptor
+cluster's server object is registered from that cluster's init callback. Without
+it a controller walking a composed device's `PartsList` cannot read what the
+parts are, and Apple Home marks the whole group unsupported — which is what it
+did, from baac5d0 until 2778efe.
+
+Create it by hand alongside `<type>::add()`:
+
+```cpp
+cluster::descriptor::config_t descriptor;
+cluster::descriptor::create(endpoint, &descriptor, CLUSTER_FLAG_SERVER);
+```
+
+The symptom is a cluster count one short of the same device type built with
+`<type>::create()`. This was misread for a year as a missing **Identify**
+cluster; `add()` does create Identify, which is why adding it by hand appeared
+to do nothing. `walk <endpoint>` prints the cluster list and settles it.
+
+## `attribute::update()` is not what a controller reads
+
+esp_matter keeps an attribute store. CHIP now also has a *cluster object* per
+cluster — everything with a directory under
+`esp_matter/data_model_provider/clusters` — and `provider::ReadAttribute()`
+checks the registry first:
+
+```cpp
+if (auto *cluster = mRegistry.Get(request.path); cluster != nullptr) {
+    return cluster->ReadAttribute(request, encoder);   // the store is never consulted
+}
+```
+
+Those objects hold their own state. `TemperatureMeasurementCluster` starts with
+`mMeasuredValue{}` — null — and esp_matter's init callback seeds only min, max
+and tolerance from the store, never the value. So `attribute::update()` writes
+the store, marks the path dirty, the controller re-reads, and gets null forever.
+Nothing logs a failure; esp_matter's own `W :` line prints the value it just
+stored, which reads like success.
+
+Affected here: TemperatureMeasurement, RelativeHumidityMeasurement,
+BooleanState, OccupancySensing. **Not** affected: OnOff and LevelControl, which
+have no cluster object and are served from the store — which is exactly why the
+lamp worked from day one while every sensor read empty.
+
+The value has to go to the object:
+
+```cpp
+auto *cluster = static_cast<TemperatureMeasurementCluster *>(
+    esp_matter::data_model::provider::get_instance().registry().Get(
+        chip::app::ConcreteClusterPath(endpointId, TemperatureMeasurement::Id)));
+cluster->SetMeasuredValue(DataModel::MakeNullable(hundredths));
+```
+
+Only `relative_humidity_measurement` ships a wrapper for this
+(`SetMeasuredValue(endpointId, value)` in its `integration.h`); temperature,
+boolean state and occupancy have none, so the registry lookup is the only way
+in. `bridgeUpdateValue()` is where this firmware does it, and every write goes
+through that one function.
+
+The endpoint config's initial value has the same problem — the object never sees
+it — so a restored reading must be pushed once after `endpoint::enable()`.
+
+To see what a controller would get, use `walk`: `attribute::get_val()` reads
+back through the provider, so it shows the object's value, not the store's.
+
 ## Endpoint IDs: build the bridge *after* `esp_matter::start()`
 
 The obvious arrangement — create every endpoint, then start the stack — is the

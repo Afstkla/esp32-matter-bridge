@@ -79,6 +79,12 @@ esp_matter::endpoint_t *bridgeAggregator();
 // to be enabled by hand.
 bool bridgePublish(esp_matter::endpoint_t *endpoint);
 
+// Writes a value where a controller reads it, which is not always esp_matter's
+// attribute store: clusters CHIP serves from a cluster object of their own need
+// that object told instead. See the comment on the implementation.
+bool bridgeUpdateValue(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId,
+                       esp_matter_attr_val_t *val);
+
 // Counts what an endpoint is made of. Most of it is bookkeeping Matter puts on
 // every cluster rather than anything the accessory uses.
 void bridgeCount(esp_matter::endpoint_t *endpoint, uint16_t *clusters, uint16_t *attributes);
@@ -185,6 +191,8 @@ public:
 
 private:
   esp_matter::endpoint_t *createNode(const char *name, uint16_t endpointId);
+  bool publishFlag();
+  bool publishValue();
 
   char _name[33] = {0};
   uint8_t _type = ACC_BUTTON;

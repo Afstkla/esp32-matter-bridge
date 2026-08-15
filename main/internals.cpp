@@ -123,9 +123,13 @@ static endpoint_t *makeChild(uint16_t wanted, void *priv) {
   if (endpoint == nullptr) {
     endpoint = endpoint::create(node::get(), ENDPOINT_FLAG_NONE, priv);
   }
-  if (endpoint != nullptr) {
-    cluster::descriptor::config_t descriptor;
-    cluster::descriptor::create(endpoint, &descriptor, CLUSTER_FLAG_SERVER);
+  if (endpoint == nullptr) {
+    return nullptr;
+  }
+  cluster::descriptor::config_t descriptor;
+  if (cluster::descriptor::create(endpoint, &descriptor, CLUSTER_FLAG_SERVER) == nullptr) {
+    ESP_LOGE(TAG, "descriptor create failed on endpoint %u", endpoint::get_id(endpoint));
+    return nullptr;
   }
   return endpoint;
 }
@@ -245,15 +249,12 @@ void internalsBegin() {
   persistIds();
 }
 
-// Called from the ui task, so the stack lock is this end's job:
-// attribute::update() walks the data model, and the CHIP task is walking it too.
 static void publishValue(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId,
                          esp_matter_attr_val_t val) {
   if (endpointId == 0) {
     return;
   }
-  StackLock lock;
-  attribute::update(endpointId, clusterId, attributeId, &val);
+  bridgeUpdateValue(endpointId, clusterId, attributeId, &val);
 }
 
 static uint32_t nowMs() {

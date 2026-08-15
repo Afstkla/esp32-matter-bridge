@@ -172,6 +172,7 @@ port at a time.
 | `ps none\|min\|max` | set WiFi power save mode |
 | `battlog` | dump the battery drain log, oldest first |
 | `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |
+| `walk [endpoint]` | print the Matter data model a controller reads — **debug surface**, device types, clusters and attributes per endpoint |
 | `passwd <secret>\|clear` | set or remove the remote console secret (see below) — USB only |
 
 `listen N` and `sleep N` in `mctl.py` are client-side helpers for scripting a

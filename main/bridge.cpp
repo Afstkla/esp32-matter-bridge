@@ -1,16 +1,23 @@
 #include "bridge.h"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
+#include <app/clusters/boolean-state-server/BooleanStateCluster.h>
+#include <app/clusters/occupancy-sensor-server/OccupancySensingCluster.h>
+#include <app/clusters/relative-humidity-measurement-server/RelativeHumidityMeasurementCluster.h>
+#include <app/clusters/temperature-measurement-server/TemperatureMeasurementCluster.h>
 #include <app/server/Server.h>
+#include <data_model_provider/esp_matter_data_model_provider.h>
 #include <platform/CHIPDeviceLayer.h>
 #include <platform/DeviceInstanceInfoProvider.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 #include <setup_payload/QRCodeSetupPayloadGenerator.h>
 
 #include "esp_heap_caps.h"
+#include "esp_matter_mem.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -232,49 +239,136 @@ static int cmdWifi(int argc, char **argv) {
   return 0;
 }
 
+// Where the walk writes while it holds the stack lock. Printing under the lock
+// is what this avoids: a netconsole client that has stopped reading blocks a
+// write for the send timeout, and the CHIP task would wait it out.
+struct WalkText {
+  char *at;
+  size_t left;
+};
+
+static void walkPrint(WalkText *out, const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  int printed = vsnprintf(out->at, out->left, fmt, args);
+  va_end(args);
+  size_t written = printed < 0 ? 0 : (size_t)printed;
+  if (written >= out->left) {
+    written = out->left - 1;
+  }
+  out->at += written;
+  out->left -= written;
+}
+
 // The data model as a controller enumerates it: the provider serves exactly
 // these device types, clusters and attributes per endpoint, so a cluster that
-// is missing here is a cluster Home cannot read.
-static void walkEndpoint(endpoint_t *endpoint) {
-  printf("EP %u parent=%u types=", endpoint::get_id(endpoint),
-         endpoint::get_parent_endpoint_id(endpoint));
+// is missing here is a cluster Home cannot read. Values are shown for character
+// strings only — get_val refuses arrays, so PartsList and DeviceTypeList show
+// as ids with no contents.
+static void walkEndpoint(WalkText *out, endpoint_t *endpoint) {
+  walkPrint(out, "EP %u parent=%u types=", endpoint::get_id(endpoint),
+            endpoint::get_parent_endpoint_id(endpoint));
   for (size_t i = 0; i < endpoint::get_device_type_count(endpoint); i++) {
     uint32_t deviceType = 0;
     uint8_t version = 0;
     endpoint::get_device_type_at_index(endpoint, i, deviceType, version);
-    printf("0x%04X ", (unsigned)deviceType);
+    walkPrint(out, "0x%04X ", (unsigned)deviceType);
   }
-  printf("\n");
+  walkPrint(out, "\n");
   for (cluster_t *c = cluster::get_first(endpoint); c != nullptr; c = cluster::get_next(c)) {
-    printf("  CL 0x%08X", (unsigned)cluster::get_id(c));
+    walkPrint(out, "  CL 0x%08X", (unsigned)cluster::get_id(c));
     for (attribute_t *a = attribute::get_first(c); a != nullptr; a = attribute::get_next(a)) {
-      printf(" 0x%04X", (unsigned)attribute::get_id(a));
+      walkPrint(out, " 0x%04X", (unsigned)attribute::get_id(a));
+      // get_val reads back through the provider, so this is the value a
+      // controller would be handed, not the one esp_matter has stored. It also
+      // decodes into a fresh string buffer the caller then owns.
       esp_matter_attr_val_t val = esp_matter_invalid(nullptr);
-      if (attribute::get_val(a, &val) == ESP_OK &&
-          val.type == ESP_MATTER_VAL_TYPE_CHAR_STRING && val.val.a.b != nullptr) {
-        printf("='%.*s'", (int)val.val.a.s, (const char *)val.val.a.b);
+      if (attribute::get_val(a, &val) != ESP_OK) {
+        continue;
       }
+      // Every string type comes back in a buffer get_val allocated for us,
+      // whether or not this prints it.
+      uint8_t *owned = nullptr;
+      switch (val.type) {
+        case ESP_MATTER_VAL_TYPE_CHAR_STRING:
+        case ESP_MATTER_VAL_TYPE_LONG_CHAR_STRING:
+        case ESP_MATTER_VAL_TYPE_OCTET_STRING:
+        case ESP_MATTER_VAL_TYPE_LONG_OCTET_STRING:
+          owned = val.val.a.b;
+          break;
+        default:
+          break;
+      }
+      if (val.is_null()) {
+        walkPrint(out, "=null");
+        esp_matter_mem_free(owned);
+        continue;
+      }
+      switch (val.get_storage_type()) {
+        case ESP_MATTER_VAL_TYPE_BOOLEAN:
+          walkPrint(out, "=%d", val.val.b ? 1 : 0);
+          break;
+        case ESP_MATTER_VAL_TYPE_UINT8:
+          walkPrint(out, "=%u", (unsigned)val.val.u8);
+          break;
+        case ESP_MATTER_VAL_TYPE_UINT16:
+          walkPrint(out, "=%u", (unsigned)val.val.u16);
+          break;
+        case ESP_MATTER_VAL_TYPE_INT16:
+          walkPrint(out, "=%d", (int)val.val.i16);
+          break;
+        case ESP_MATTER_VAL_TYPE_CHAR_STRING:
+          if (val.val.a.b != nullptr) {
+            walkPrint(out, "='%.*s'", (int)val.val.a.s, (const char *)val.val.a.b);
+          }
+          break;
+        default:
+          break;
+      }
+      esp_matter_mem_free(owned);
     }
-    printf("\n");
+    walkPrint(out, "\n");
   }
 }
 
+// ponytail: one snapshot buffer for the whole sweep; `walk <endpoint>` is the
+// answer if a node ever grows past it.
+static const size_t WALK_TEXT_SIZE = 8192;
+
 static int cmdWalk(int argc, char **argv) {
-  char vendor[33] = {0}, product[33] = {0}, serial[33] = {0};
-  auto *info = chip::DeviceLayer::GetDeviceInstanceInfoProvider();
-  info->GetVendorName(vendor, sizeof(vendor));
-  info->GetProductName(product, sizeof(product));
-  info->GetSerialNumber(serial, sizeof(serial));
-  printf("ROOT vendor='%s' product='%s' serial='%s'\n", vendor, product, serial);
+  char *text = (char *)heap_caps_malloc(WALK_TEXT_SIZE, MALLOC_CAP_SPIRAM);
+  if (text == nullptr) {
+    printf("WALK out of memory\n");
+    return 1;
+  }
+  text[0] = '\0';
+  WalkText out = {text, WALK_TEXT_SIZE};
 
   bool all = argc < 2;
   uint16_t wanted = all ? 0 : (uint16_t)strtoul(argv[1], nullptr, 0);
-  StackLock lock;
-  for (endpoint_t *e = endpoint::get_first(node::get()); e != nullptr; e = endpoint::get_next(e)) {
-    if (all || endpoint::get_id(e) == wanted) {
-      walkEndpoint(e);
+  {
+    StackLock lock;
+    for (endpoint_t *e = endpoint::get_first(node::get()); e != nullptr;
+         e = endpoint::get_next(e)) {
+      if (all || endpoint::get_id(e) == wanted) {
+        walkEndpoint(&out, e);
+      }
     }
   }
+
+  char vendor[33] = {0}, product[33] = {0}, serial[33] = {0};
+  auto *info = chip::DeviceLayer::GetDeviceInstanceInfoProvider();
+  // An unreadable field stays the empty string, which is the answer worth
+  // printing: it is what a controller would get too.
+  (void)info->GetVendorName(vendor, sizeof(vendor));
+  (void)info->GetProductName(product, sizeof(product));
+  (void)info->GetSerialNumber(serial, sizeof(serial));
+  printf("ROOT vendor='%s' product='%s' serial='%s'\n", vendor, product, serial);
+  fputs(text, stdout);
+  if (out.left <= 1) {
+    printf("WALK truncated at %u bytes\n", (unsigned)WALK_TEXT_SIZE);
+  }
+  heap_caps_free(text);
   return 0;
 }
 
@@ -311,10 +405,66 @@ bool bridgeStart() {
   return true;
 }
 
+// esp_matter's attribute store is not what a controller reads. Every cluster
+// that has an object under esp_matter's data_model_provider/clusters —
+// measurements, boolean state, occupancy — is served from that object's own
+// state, while attribute::update() writes the store: the path is marked dirty
+// and the controller then re-reads the value the object was built with, null
+// for a measurement and false for a flag. OnOff and LevelControl have no such
+// object and are served from the store, which is why the lamp worked from the
+// first day and every sensor read empty.
+template <typename T>
+static T *serverCluster(uint16_t endpointId, uint32_t clusterId) {
+  return static_cast<T *>(esp_matter::data_model::provider::get_instance().registry().Get(
+      chip::app::ConcreteClusterPath(endpointId, clusterId)));
+}
+
+static chip::app::DataModel::Nullable<int16_t> nullableInt16(const esp_matter_attr_val_t *val) {
+  return val->is_null() ? chip::app::DataModel::Nullable<int16_t>()
+                        : chip::app::DataModel::MakeNullable(val->val.i16);
+}
+
+static chip::app::DataModel::Nullable<uint16_t> nullableUint16(const esp_matter_attr_val_t *val) {
+  return val->is_null() ? chip::app::DataModel::Nullable<uint16_t>()
+                        : chip::app::DataModel::MakeNullable(val->val.u16);
+}
+
+bool bridgeUpdateValue(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId,
+                       esp_matter_attr_val_t *val) {
+  StackLock lock;
+  switch (clusterId) {
+    case TemperatureMeasurement::Id: {
+      auto *cluster = serverCluster<TemperatureMeasurementCluster>(endpointId, clusterId);
+      return cluster != nullptr && cluster->SetMeasuredValue(nullableInt16(val)) == CHIP_NO_ERROR;
+    }
+    case RelativeHumidityMeasurement::Id: {
+      auto *cluster = serverCluster<RelativeHumidityMeasurementCluster>(endpointId, clusterId);
+      return cluster != nullptr && cluster->SetMeasuredValue(nullableUint16(val)) == CHIP_NO_ERROR;
+    }
+    case BooleanState::Id: {
+      auto *cluster = serverCluster<BooleanStateCluster>(endpointId, clusterId);
+      if (cluster == nullptr) {
+        return false;
+      }
+      cluster->SetStateValue(val->val.b);
+      return true;
+    }
+    case OccupancySensing::Id: {
+      auto *cluster = serverCluster<OccupancySensingCluster>(endpointId, clusterId);
+      if (cluster == nullptr) {
+        return false;
+      }
+      cluster->SetOccupancy(val->val.u8 != 0);
+      return true;
+    }
+    default:
+      return esp_matter::attribute::update(endpointId, clusterId, attributeId, val) == ESP_OK;
+  }
+}
+
 bool MatterEndPoint::updateAttributeVal(uint32_t clusterId, uint32_t attributeId,
                                         esp_matter_attr_val_t *val) {
-  StackLock lock;
-  return esp_matter::attribute::update(_endpointId, clusterId, attributeId, val) == ESP_OK;
+  return bridgeUpdateValue(_endpointId, clusterId, attributeId, val);
 }
 
 // Endpoints built before esp_matter::start() are registered by the stack as it
@@ -546,6 +696,13 @@ bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId
 
   setEndPointId(endpoint::get_id(endpoint));
   _started = true;
+  // The cluster object a controller reads from starts empty whatever the
+  // endpoint config said, so the restored reading has to be pushed in once.
+  if (accessoryUi(type) == UI_VALUE) {
+    publishValue();
+  } else if (accessoryUi(type) == UI_FLAG) {
+    publishFlag();
+  }
   uint16_t clusters = 0, attributes = 0;
   bridgeCount(endpoint, &clusters, &attributes);
   ESP_LOGI(TAG, "%s '%s' on endpoint %u (%u clusters, %u attributes)", accessoryTypeName(type),
@@ -553,18 +710,33 @@ bool BridgedAccessory::begin(uint8_t type, const char *name, uint16_t endpointId
   return true;
 }
 
+bool BridgedAccessory::publishFlag() {
+  if (_type == ACC_MOTION) {
+    esp_matter_attr_val_t val = esp_matter_bitmap8(_flag ? 1 : 0);
+    return updateAttributeVal(OccupancySensing::Id, OccupancySensing::Attributes::Occupancy::Id,
+                              &val);
+  }
+  esp_matter_attr_val_t val = esp_matter_bool(_flag);
+  return updateAttributeVal(BooleanState::Id, BooleanState::Attributes::StateValue::Id, &val);
+}
+
+bool BridgedAccessory::publishValue() {
+  if (_type == ACC_HUMIDITY) {
+    esp_matter_attr_val_t val = esp_matter_nullable_uint16((uint16_t)_value);
+    return updateAttributeVal(RelativeHumidityMeasurement::Id,
+                              RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val);
+  }
+  esp_matter_attr_val_t val = esp_matter_nullable_int16(_value);
+  return updateAttributeVal(TemperatureMeasurement::Id,
+                            TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
+}
+
 bool BridgedAccessory::setFlag(bool active) {
   if (!_started || _flag == active) {
     return _started;
   }
   _flag = active;
-  if (_type == ACC_MOTION) {
-    esp_matter_attr_val_t val = esp_matter_bitmap8(active ? 1 : 0);
-    return updateAttributeVal(OccupancySensing::Id, OccupancySensing::Attributes::Occupancy::Id,
-                              &val);
-  }
-  esp_matter_attr_val_t val = esp_matter_bool(active);
-  return updateAttributeVal(BooleanState::Id, BooleanState::Attributes::StateValue::Id, &val);
+  return publishFlag();
 }
 
 bool BridgedAccessory::setValue(int16_t hundredths) {
@@ -572,14 +744,7 @@ bool BridgedAccessory::setValue(int16_t hundredths) {
     return _started;
   }
   _value = hundredths;
-  if (_type == ACC_HUMIDITY) {
-    esp_matter_attr_val_t val = esp_matter_nullable_uint16((uint16_t)hundredths);
-    return updateAttributeVal(RelativeHumidityMeasurement::Id,
-                              RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val);
-  }
-  esp_matter_attr_val_t val = esp_matter_nullable_int16(hundredths);
-  return updateAttributeVal(TemperatureMeasurement::Id,
-                            TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
+  return publishValue();
 }
 
 bool BridgedAccessory::remove() {
