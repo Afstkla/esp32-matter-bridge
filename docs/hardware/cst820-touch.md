@@ -239,13 +239,21 @@ poll will ever see. So `powerArmTouchWake()` arms the wake source **and** hangs
 a GPIO ISR on the same pad; the handler sets a flag the ui tick reads.
 
 That handler has to mask itself, because the trigger is a level and a level ISR
-re-enters for as long as the line is down. `gpio_intr_disable()` is the right
-mask and it is worth knowing exactly why: it reaches
-`gpio_ll_intr_disable()`, which is `hw->pin[n].int_ena = 0` and **nothing
-else** — `int_type` (the low-level trigger) and `wakeup_enable` both survive it,
-so masking the CPU interrupt leaves the light-sleep wake source armed. Nothing
-in the API contract says so; it is `components/hal/esp32s3/include/hal/gpio_ll.h`
-that says so.
+re-enters for as long as the line is down: `gpio_isr_loop()` clears the pending
+status on entry only for pins in `isr_clr_on_entry_mask`, and
+`gpio_set_intr_type()` puts **only edge types** in that mask, so a level pin's
+status is sticky across the handler.
+
+`gpio_intr_disable()` is the right mask, and it is worth knowing exactly what it
+does. `gpio.c:192` calls `gpio_hal_intr_disable()`, which is two things
+(`components/hal/gpio_hal.c:24`): `gpio_ll_intr_disable()` — `pin[n].int_ena = 0`
+— **and** a clear of the pending status bit, which is the second half of why the
+self-mask works at all. What it does *not* touch is `int_type` (the low-level
+trigger) or `wakeup_enable`: neither is written anywhere on that path, so the
+light-sleep wake source stays armed through the mask and only an explicit
+disarm takes it down. Nothing in the API contract says so — the source does
+(`esp_driver_gpio/src/gpio.c`, `hal/gpio_hal.c`, `hal/esp32s3/include/hal/gpio_ll.h`
+in the pinned IDF v5.5.5).
 
 The same level semantics are why arming is skipped when the line is already low
 (`TP_INT already low, leaving touch wake disarmed`): the handler would fire at
@@ -253,7 +261,19 @@ once, the screen would wake, idle out and re-arm in a loop, and the hardware
 would refuse every light sleep in between (the 4442 rejects above). INT idles
 high powered, in standby and unpowered alike, so a low line at arm time is a
 fault, and losing touch wake for that one cycle is the safe reading of it — the
-tier-1 window still expires into the rail cut.
+tier-1 window still expires into the rail cut. **The refusal only degrades
+cleanly if the latch is cleared with it**, which is the first thing
+`powerArmTouchWake()` does on every transition: a latch surviving from the last
+touch wake fires ~250 ms into the next tier-1 entry, and the "skip touch wake
+this cycle" fault becomes the wake loop the check was written to prevent.
+
+Because a 1 ms pulse has to survive a CPU-power-gated light sleep to reach that
+handler at all (`CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP` is on),
+`powerTouchWoke()` also reads `esp_sleep_get_wakeup_causes()` for
+`BIT(ESP_SLEEP_WAKEUP_GPIO)`. GPIO21 is the only GPIO wake source in this
+firmware, so that bit can only mean this pin. Two independent readings: without
+the second, a latch that does not survive the resume would look exactly like a
+finger that never pulled INT low, and the bench would blame the digitiser.
 
 **What is still not proven is the last hop**: a low pulse *arriving while the
 chip is asleep*. Nothing on this board can produce one on demand — the CST820

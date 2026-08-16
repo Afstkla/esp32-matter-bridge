@@ -221,10 +221,10 @@ static void openTpInt() {
 // 250 ms tick, so the line has to be latched in hardware. This is that latch.
 //
 // It masks itself because the trigger is a level: gpio_intr_disable() clears the
-// pin's interrupt enable and nothing else — the low-level trigger and the wakeup
-// bit both survive it — so the wake source stays live until the ui task disarms
-// it, and one INT pulse produces exactly one handler call instead of a storm for
-// as long as the line stays down.
+// pin's interrupt enable and the pending status bit, and touches neither
+// int_type nor wakeup_enable — so the wake source stays live through the mask
+// until the ui task disarms it, and one INT pulse produces exactly one handler
+// call instead of a storm for as long as the line stays down.
 static void onTpInt(void *) {
   s_intFired = true;
   gpio_intr_disable(PIN_TP_INT);
@@ -236,6 +236,17 @@ static void onTpInt(void *) {
 // sleep. Arming by hand through rtc_gpio_wakeup_enable() would skip that and
 // the pin would be deaf.
 void powerArmTouchWake(bool on) {
+  // Every transition clears the latch, refusals and redundant disarms included.
+  // A latch left standing from the last touch wake would fire ~250 ms into the
+  // next tier-1 entry — a phantom wake, and with it a doze/rouse/TP_RESET cycle
+  // every idle period for as long as the device was left alone.
+  s_intFired = false;
+  // Every wake calls this, mostly on a pin that was never armed; there is no
+  // reason to run four register paths (gpio_config includes rtc_gpio_deinit) to
+  // undo nothing, and doing so also makes `tpint` unreadable after any wake.
+  if (!on && !s_intArmed) {
+    return;
+  }
   openTpInt();
   if (on) {
     // Arming against a line already at its trigger level fires the handler at
@@ -249,7 +260,6 @@ void powerArmTouchWake(bool on) {
       s_intArmed = false;
       return;
     }
-    s_intFired = false;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(PIN_TP_INT, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
     // Adding the handler is also what re-enables the interrupt the last INT
@@ -264,8 +274,33 @@ void powerArmTouchWake(bool on) {
   s_intArmed = on;
 }
 
+// The latch is the fast path, not the only evidence. CONFIG_PM_POWER_DOWN_CPU_
+// IN_LIGHT_SLEEP is on, and if the digital interrupt status does not survive
+// that resume the handler never runs — which from up here looks exactly like a
+// finger that never pulled INT low, i.e. like the one hardware question Task 1
+// could not close. The wake-cause register is the second, independent reading:
+// GPIO21 is the only GPIO wake source in this firmware, so BIT(GPIO) can only
+// mean this pin, and it is only consulted while the source is armed (it holds
+// the last sleep's cause until the next one, and every tier-1 tick sleeps).
 bool powerTouchWoke() {
-  return s_intFired;
+  if (s_intFired) {
+    return true;
+  }
+  return s_intArmed && (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_GPIO)) != 0;
+}
+
+// `tpint arm|disarm` is a second writer to the pad, the wake bitmap and
+// s_intArmed, all of which belong to the ui task now that they are a shipped
+// transition rather than Task 1's bench-only probe. So the console records
+// intent and powerPoll() applies it, exactly as `power usbsim` does with the PM
+// lock, and waits so its own readout is the settled one.
+static volatile int8_t s_armWanted = -1;
+
+static void requestTouchWake(bool on) {
+  s_armWanted = on ? 1 : 0;
+  for (int i = 0; i < 100 && s_armWanted >= 0; i++) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
 // Open drain, so the bench can pull the line low exactly as the digitiser does
@@ -363,9 +398,9 @@ static int cmdTpint(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && strcasecmp(argv[1], "arm") == 0) {
-    powerArmTouchWake(true);
+    requestTouchWake(true);
   } else if (argc == 2 && strcasecmp(argv[1], "disarm") == 0) {
-    powerArmTouchWake(false);
+    requestTouchWake(false);
   } else if (argc == 3 && strcasecmp(argv[1], "drive") == 0) {
     if (!driveTpInt(argv[2])) {
       printf("ERR usage: tpint drive <0|1|z>\n");
@@ -489,6 +524,12 @@ void powerBegin() {
   openTpInt();
   // The touch wake needs a handler, not just a wake source: waking the chip only
   // shortens a light sleep, and the ui task has to hear about it.
+  //
+  // No ESP_INTR_FLAG_IRAM, deliberately: onTpInt() and the gpio_intr_disable()
+  // it calls both live in flash (CONFIG_GPIO_CTRL_FUNC_IN_IRAM is off), so
+  // without the flag the shared interrupt is simply masked while the cache is
+  // disabled. Adding the flag later without moving both into IRAM would break
+  // the handler silently.
   ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_install_isr_service(0));
   consoleRegisterCmd("tpint",
                      "Touch INT (GPIO21) wake probe: no args reads the line, 'arm'|'disarm' the "
@@ -513,6 +554,12 @@ static void sample(const PmuStatus &pmu, bool boot) {
 }
 
 void powerPoll() {
+  if (s_armWanted >= 0) {
+    bool want = s_armWanted == 1;
+    powerArmTouchWake(want);
+    s_armWanted = -1;
+  }
+
   PmuStatus pmu = pmuStatus();
   if (!pmu.present) {
     return;

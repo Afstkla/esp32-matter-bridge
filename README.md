@@ -338,7 +338,7 @@ transition; `power` reports which tier it is in as `screen=on|tier1|tier2`.
 | Panel | DISPOFF + SLPIN | DISPOFF, then unpowered |
 | Digitiser | standby (`0xFE = 0x00`), I2C off | unpowered |
 | Wake | **a finger** on the glass, or PWR | **PWR only** |
-| Cost of waking | ~200 ms — 139 ms measured for SLPOUT + the 120 ms settle, plus a TP_RESET pulse and touch re-init (**the sum is not yet measured end to end**) | **~261 ms** measured module cold start |
+| Cost of waking | ~200 ms typical — a 139 ms rouse (measured: 19 ms of commands around the 120 ms settle) plus a TP_RESET pulse and touch re-init; **the sum is not yet measured end to end**, and a digitiser that needs its full retry budget can take it to ~660 ms | **~261 ms** measured module cold start |
 | Idle draw | ~150 µA by datasheet, **never measured** | the module contributes nothing |
 
 Tier 1 is what makes wake-on-touch possible: the digitiser stays powered, its
@@ -356,7 +356,10 @@ soak has priced it.
 The **PWR** key wakes from both tiers and cannot be missed: its PMU interrupt
 latches, so a press waits for whenever the ui tick gets there. `touchdump`
 answering `DUMP read failed` is the check that the rail is down — but only in
-tier 2, since standby produces exactly the same NAKs with the rail up.
+tier 2, since standby produces exactly the same NAKs with the rail up — and
+running `touchdump` during tier 1 is worse than useless: failed transactions
+sometimes rouse a standby part, so the debug command can assert INT and wake the
+screen it was meant to observe.
 
 **Expected shelf life: not yet measured.** The board has no current sense and
 the AXP2101 no current ADC, and the die temperature was shown to be blind to the

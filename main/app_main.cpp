@@ -182,6 +182,15 @@ static void showQr(bool on) {
 // standby, so a finger wakes the screen through the INT line. Tier 2 is what the
 // firmware did before wake-on-touch: rail down, PWR key only.
 static void enterTier1() {
+  // A `sleep` on an already-dark screen must change nothing. From tier 2 it
+  // would otherwise arm a wake source against an unpowered digitiser that the
+  // expiry branch — gated on panelDozing() — would then never disarm; from
+  // tier 1 it would push out the window whose entire job is to bound how long
+  // the rail stays up on an unmeasured idle draw.
+  if (panelDark()) {
+    printf("SLEEP tier=%d\n", panelDozing() ? 1 : 2);
+    return;
+  }
   panelDoze();
   powerArmTouchWake(true);
   s_tier1StartedAt = nowMs();
@@ -348,18 +357,23 @@ static void pollFinder() {
   wasFinding = finding;
 }
 
+// `applied` is set where each intent is taken, never from a snapshot at the top:
+// a command landing between such a snapshot and its own branch would be applied
+// in this pass without counting, and its awaitUi() would then wait out the full
+// timeout having missed the very tick that served it.
 static void pollRequests() {
-  bool applied = s_brightnessWanted >= 0 || s_sleepWanted >= 0 || s_swipeWanted != 0 ||
-                 s_qrToggleWanted || s_tapX >= 0;
+  bool applied = false;
   if (s_brightnessWanted >= 0) {
     uint8_t level = (uint8_t)s_brightnessWanted;
     s_brightnessWanted = -1;
+    applied = true;
     panelBrightness(level);
     printf("BRIGHT %u\n", level);
   }
   if (s_sleepWanted >= 0) {
     bool wantsSleep = s_sleepWanted == 1;
     s_sleepWanted = -1;
+    applied = true;
     if (wantsSleep) {
       enterTier1();
     } else {
@@ -370,15 +384,18 @@ static void pollRequests() {
   if (s_swipeWanted != 0) {
     int8_t direction = s_swipeWanted;
     s_swipeWanted = 0;
+    applied = true;
     runSwipe(direction);
   }
   if (s_qrToggleWanted) {
     s_qrToggleWanted = false;
+    applied = true;
     showQr(!s_showQr);
   }
   if (s_tapX >= 0) {
     int16_t x = s_tapX, y = s_tapY;
     s_tapX = -1;
+    applied = true;
     noteActivity();
     handleRelease(x, y, x, y);
   }
