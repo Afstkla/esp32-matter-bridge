@@ -122,10 +122,12 @@ AXP2101 DCDC1 (3.3 V)  →  VCC3V3  →  DSI_PWR_EN (TCA9554 EXIO)  →  VCI
 ```
 
 **The panel and the digitiser share one supply domain.** That single fact
-drives most of this board's power behaviour: screen sleep cuts the rail
-(worth the larger half of the shelf drain), so touch dies with the panel,
-the PWR key is the only wake, and waking is a full ~261 ms module cold
-start. See [co5300-display.md](co5300-display.md) and
+drives most of this board's power behaviour, and it is why screen sleep is
+two tiers rather than one: for the first minute the rail stays up with the
+panel in SLPIN and the digitiser in standby, so a finger still wakes the
+device (~200 ms back); after it the rail goes down for the larger half of
+the shelf drain, and the PWR key is the only wake left (~261 ms cold start).
+See [co5300-display.md](co5300-display.md) and
 [cst820-touch.md](cst820-touch.md).
 
 `DCDC1 = VCC3V3` was established while chasing the shelf drain; the firmware
@@ -142,7 +144,7 @@ default.
 | I2C SDA | 15 | shared bus |
 | I2C SCL | 14 | shared bus |
 | BOOT key | 0 | active low, internal pull-up |
-| **TP_INT** | **21** | CST820 interrupt, 10 kΩ pull-up to VCC3V3 — **measured idle-high** with the rail both up and cut, so the pull-up is upstream of `DSI_PWR_EN` and level-low is the wake trigger. `powerBegin()` configures it as an input; the `tpint` console command owns it. See [cst820-touch.md](cst820-touch.md) |
+| **TP_INT** | **21** | CST820 interrupt, 10 kΩ pull-up to VCC3V3 — **measured idle-high** with the rail both up and cut, so the pull-up is upstream of `DSI_PWR_EN` and level-low is the wake trigger. `powerBegin()` configures it as an input and installs the GPIO ISR service; the ui task arms it (wake source **and** a self-masking level ISR) for the length of tier 1, and the `tpint` console command drives the same plumbing by hand. See [cst820-touch.md](cst820-touch.md) |
 | I2S MCLK | 16 | audio, wired and mandatory |
 | I2S BCLK | 9 | audio |
 | I2S WS | 45 | audio, **strapping pin** |

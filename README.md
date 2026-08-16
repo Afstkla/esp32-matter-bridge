@@ -160,13 +160,13 @@ port at a time.
 | `swipe left\|right` | change page, animation included |
 | `tap X Y` | inject a tap at a coordinate |
 | `bright 0-255` | set panel brightness |
-| `sleep` / `wake` | power the display module down / back up and redraw |
-| `doze <0\|1> [settle-ms]` | blank the screen with SLPIN, panel rail left up — 29 ms down, 139 ms back against `wake`'s 261 ms — **debug surface** |
+| `sleep` / `wake` | blank the screen (tier 1, so touch still wakes it) / bring it back and redraw |
+| `doze <0\|1> [settle-ms]` | `sleep`/`wake` with the SLPOUT settle exposed, for bisecting it against the panel — 29 ms down, 139 ms back at the shipped 120 ms settle — **debug surface** |
 | `beep [on\|off]` | beep every 1.72 seconds until told to stop, or report the state |
 | `finder [on\|off\|identify]` | start or stop a finder session the way a controller would, or fire the 5 s Identify burst |
 | `micdump <ms>` | record from the onboard microphone and stream it as base64 (see below) — **debug surface** |
 | `qr` | toggle the pairing screen |
-| `idle N` | blank the screen after N seconds, 0 to never |
+| `idle N [T]` | blank the screen after N seconds, 0 to never; `T` sets how many seconds tier 1 then holds the rail up (0 = straight to the rail cut) |
 | `reset slots` | remove every accessory (restarts) |
 | `wifi` | which network the driver actually joined |
 | `pairing` | manual pairing code and QR payload |
@@ -176,7 +176,7 @@ port at a time.
 | `touchreg [<reg> [<value>]]` | dump the CST820's whole register map, or read/write one — **debug surface** |
 | `screendump` | stream the framebuffer as base64 (see below) |
 | `power [locks\|timers\|rails\|on\|off\|80\|160\|240\|active <ms>\|usbsim on\|off]` | power management tuning and drain instrumentation — **debug surface** |
-| `tpint [arm\|disarm\|drive <0\|1\|z>\|scope <ms>\|watch <ms>]` | the touch INT line (GPIO21) and its light-sleep wake source — read the level, arm the wake, pull the line open-drain, sample it every ms, or run a battery-simulated window and count what woke the chip — **debug surface** |
+| `tpint [arm\|disarm\|drive <0\|1\|z>\|scope <ms>\|watch <ms>]` | the touch INT line (GPIO21) and the tier-1 wake source built on it — read level/armed/fired, arm or disarm the wake by hand, pull the line open-drain, sample it every ms, or run a battery-simulated window and count what woke the chip — **debug surface** |
 | `ps none\|min\|max` | set WiFi power save mode |
 | `battlog` | dump the battery drain log, oldest first |
 | `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |
@@ -322,23 +322,41 @@ interleaved four-minute windows, 50 ms → 26.7/24.9%, the 8 ms floor →
 live and `power` reports `active=`; it is kept as the instrument that settles
 that question, not as a setting anyone needs to touch.
 
-**Screen sleep powers the display module down.** Brightness 0 is not off: the
-CO5300 keeps its charge pump running for ELVDD/ELVSS whatever it is showing, and
-this firmware used to leave `DSI_PWR_EN` asserted for the device's whole life —
-`DCDC1` 3.3 V → `VCC3V3` → `DSI_PWR_EN` on the TCA9554 → `VCI` → panel. Sleeping
-now sends DISPOFF and then drops that expander bit, and waking is a cold start of
-the module: reset pulse, full CO5300 init, a black frame, then the backlight.
+### Screen sleep is two tiers
 
-Two consequences, both deliberate:
+Brightness 0 is not off: the CO5300 keeps its charge pump running for
+ELVDD/ELVSS whatever it is showing, and this firmware used to leave
+`DSI_PWR_EN` asserted for the device's whole life — `DCDC1` 3.3 V → `VCC3V3` →
+`DSI_PWR_EN` on the TCA9554 → `VCI` → **panel and digitiser together**. Cutting
+that rail is worth the larger half of the shelf drain and takes touch with it,
+so the screen goes dark in two steps instead of one. The ui task owns every
+transition; `power` reports which tier it is in as `screen=on|tier1|tier2`.
 
-- **Waking takes ~260 ms** (measured; the CO5300's own init delays are most of
-  it, and `panel wake took N ms` is logged on every wake) instead of the one
-  register write it used to be.
-- **Touch cannot wake the device.** The CST816 sits on the same `VCI` domain, so
-  it is unpowered while the screen is off — `touchdump` answering `DUMP read
-  failed` is the check that the rail is down. The **PWR** key is the wake: its
-  PMU interrupt latches, so a press is never missed. Keeping touch alive would
-  mean keeping the rail up, which is most of the saving.
+| | Tier 1 — the first 60 s dark | Tier 2 — after that |
+|---|---|---|
+| Rail | **up** | **cut** (`DSI_PWR_EN` low) |
+| Panel | DISPOFF + SLPIN | DISPOFF, then unpowered |
+| Digitiser | standby (`0xFE = 0x00`), I2C off | unpowered |
+| Wake | **a finger** on the glass, or PWR | **PWR only** |
+| Cost of waking | ~200 ms — 139 ms measured for SLPOUT + the 120 ms settle, plus a TP_RESET pulse and touch re-init (**the sum is not yet measured end to end**) | **~261 ms** measured module cold start |
+| Idle draw | ~150 µA by datasheet, **never measured** | the module contributes nothing |
+
+Tier 1 is what makes wake-on-touch possible: the digitiser stays powered, its
+INT line (GPIO21) is armed as a light-sleep wake source with a latching handler
+behind it, and a touch takes the screen back without a button. Nothing polls
+touch while it is in standby — the chip powers its own I2C interface down, so
+the INT line is the only way out of it.
+
+**The 60 s window is a budget, not a preference.** Nothing on this board can
+measure tier 1's idle draw (no current sense, no current ADC in the PMU), so
+the window caps how long the device is exposed to a number that is still
+datasheet-only. Grow `TIER1_WINDOW_MS` in `main/app_main.cpp` once a `battlog`
+soak has priced it.
+
+The **PWR** key wakes from both tiers and cannot be missed: its PMU interrupt
+latches, so a press waits for whenever the ui tick gets there. `touchdump`
+answering `DUMP read failed` is the check that the rail is down — but only in
+tier 2, since standby produces exactly the same NAKs with the rail up.
 
 **Expected shelf life: not yet measured.** The board has no current sense and
 the AXP2101 no current ADC, and the die temperature was shown to be blind to the

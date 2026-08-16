@@ -99,6 +99,24 @@ while the ui task's 20 ms `pollTouch()` keeps hammering it. **A TP_RST pulse
 always fixes it** — `sleep` then `wake` (which runs `releaseResets()`) restores
 both the chip and `0xFE = 0x01`. Registers are volatile; nothing persists.
 
+### How the firmware enters and leaves it (tier 1)
+
+`panelDoze()` writes `0xFE = 0x00` after the panel's SLPIN, and `panelRouse()`
+brings the part back with a **TP_RESET-only pulse** — expander output register
+`0x01`: `0x07 → 0x03 → 0x07`, 20 ms each way, then the usual `touchInit()`
+retry loop. Clearing EXIO2 alone leaves DSI_PWR_EN and LCD_RESET high, so the
+digitiser restarts without the module's 261 ms cold start; `releaseResets()`
+(which drops all three) is the tier-2 path and stays that way. *Unverified on
+hardware — the pulse itself is what `sleep`/`wake` has always done, but never
+before with the other two bits held high.*
+
+Two rules follow from standby killing the I2C interface, and the firmware obeys
+both: `panelTouch()` is fenced off on `panelDozing()` so nothing polls a part
+that cannot answer, and a `touchInit()` that fails after the reset pulse is
+treated as a failed rouse — the rail drops and the caller cold-starts the
+module. A lit screen with a deaf digitiser is the worse outcome, since touch is
+the whole point of the tier.
+
 `0xA5 = 0x03` (the generic software-sleep command) is **still unprobed**: every
 attempt to write it landed while the chip was already in standby and NAKed.
 
@@ -120,8 +138,9 @@ the datasheets, and re-probe with the NAK-means-asleep reading in mind.
 CST820`. One supply domain, and the consequences run through the whole
 design:
 
-- Screen sleep cuts that rail, so **the digitiser is unpowered while the
-  screen is off**. PWR wakes the device; touch cannot.
+- Tier-2 screen sleep cuts that rail, so **the digitiser is unpowered** and PWR
+  is the only wake. Tier 1 (the first minute) leaves the rail up precisely so
+  that it is not.
 - Arduino-era, same cause: `Arduino_CO5300::displayOff()` sends DISPOFF then
   SLPIN, and sleeping the panel controller took the digitiser with it —
   observed as the raw touch registers freezing entirely, with nothing able
@@ -210,6 +229,31 @@ the S3 does not define that. The automatic
 path adds its own timer source on top and calls the same
 `esp_light_sleep_start()` (`pm_impl.c`'s `vApplicationSleep`), clearing
 nothing. So the GPIO source is armed, live and evaluated on the automatic path.
+
+### The wake source is not the whole wake: the line has to be latched
+
+Waking the chip only *shortens a light sleep*. The ui task is still parked in
+its 250 ms `vTaskDelay` and learns nothing, and the INT assertion is a pulse —
+the generic map puts `0xED` (IrqPluseWidth) at 1 ms by default, which no 250 ms
+poll will ever see. So `powerArmTouchWake()` arms the wake source **and** hangs
+a GPIO ISR on the same pad; the handler sets a flag the ui tick reads.
+
+That handler has to mask itself, because the trigger is a level and a level ISR
+re-enters for as long as the line is down. `gpio_intr_disable()` is the right
+mask and it is worth knowing exactly why: it reaches
+`gpio_ll_intr_disable()`, which is `hw->pin[n].int_ena = 0` and **nothing
+else** — `int_type` (the low-level trigger) and `wakeup_enable` both survive it,
+so masking the CPU interrupt leaves the light-sleep wake source armed. Nothing
+in the API contract says so; it is `components/hal/esp32s3/include/hal/gpio_ll.h`
+that says so.
+
+The same level semantics are why arming is skipped when the line is already low
+(`TP_INT already low, leaving touch wake disarmed`): the handler would fire at
+once, the screen would wake, idle out and re-arm in a loop, and the hardware
+would refuse every light sleep in between (the 4442 rejects above). INT idles
+high powered, in standby and unpowered alike, so a low line at arm time is a
+fault, and losing touch wake for that one cycle is the safe reading of it — the
+tier-1 window still expires into the rail cut.
 
 **What is still not proven is the last hop**: a low pulse *arriving while the
 chip is asleep*. Nothing on this board can produce one on demand — the CST820

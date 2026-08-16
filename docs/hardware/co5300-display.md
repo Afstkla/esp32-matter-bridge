@@ -72,11 +72,11 @@ which is the opposite of the assumption the current rail-cut design was
 built on. Still unverified — the one number nobody has is the module's own
 upstream regulator overhead, and only a battery-slope soak can supply it.
 
-Today's `panelSleep()` deliberately does **not** send SLPIN: the driver's
-`disp_on_off` only sends DISPOFF, so SLPIN would be a raw QSPI command, and
-it saves nothing once VCI is gone and the reset lines are low. That
-reasoning is correct *for the rail-cut design* and stops applying the moment
-the rail stays up.
+Both ship, as the two tiers of one sleep: `panelDoze()` (SLPIN, rail up) for
+the first minute after the screen goes dark, `panelSleep()` (rail cut) after
+that. `panelSleep()` still does **not** send SLPIN — the driver's `disp_on_off`
+only sends DISPOFF, and SLPIN saves nothing once VCI is gone and the reset lines
+are low.
 
 Sleep order that works: black the framebuffer, brightness 0, DISPOFF, 20 ms
 settle (the module's decoupling bleeding down), then drop the expander bit.
@@ -126,6 +126,13 @@ What is genuinely cheaper about this path is not the 122 ms. It is that VCI
 never drops, so the controller keeps its configuration and its GRAM, no
 SWRESET/MADCTL/COLMOD/vendor sequence runs, **and the CST820 on the same rail
 stays alive** — which is the entire reason wake-on-touch is possible at all.
+
+The settle that ships is `PANEL_SLPOUT_SETTLE_MS` in `main/panel.h`, **120 ms**,
+the datasheet-safe one — one constant, used as the default of the one runtime
+knob (`doze <0|1> [settle-ms]`, which drives the shipped path rather than a
+bench copy of it). A rouse also has to revive the digitiser, so the tier-1 wake
+is the 139 ms plus a TP_RESET pulse and the touch retry loop (~40–60 ms when the
+part answers at once, as it does after a rail-cut wake).
 
 ## Waking is a full re-init — ~261 ms
 
