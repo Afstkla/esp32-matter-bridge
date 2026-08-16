@@ -157,6 +157,7 @@ static bool setWifiPs(const char *mode) {
 static const gpio_num_t PIN_TP_INT = GPIO_NUM_21;
 static bool s_intArmed = false;
 static volatile bool s_intFired = false;
+static uint32_t s_causesAtArm = 0;
 
 // Which tier the screen is in, and whether the touch wake is armed, are the two
 // states a wake-on-touch session needs to see and neither is visible from
@@ -260,6 +261,7 @@ void powerArmTouchWake(bool on) {
       s_intArmed = false;
       return;
     }
+    s_causesAtArm = esp_sleep_get_wakeup_causes();
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(PIN_TP_INT, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
     // Adding the handler is also what re-enables the interrupt the last INT
@@ -280,13 +282,22 @@ void powerArmTouchWake(bool on) {
 // finger that never pulled INT low, i.e. like the one hardware question Task 1
 // could not close. The wake-cause register is the second, independent reading:
 // GPIO21 is the only GPIO wake source in this firmware, so BIT(GPIO) can only
-// mean this pin, and it is only consulted while the source is armed (it holds
-// the last sleep's cause until the next one, and every tier-1 tick sleeps).
+// mean this pin.
+//
+// It has to be read as a *change* since the arm, not as a level, because the
+// register is frozen whenever the chip does not light sleep — `esp_light_sleep_
+// start()` is the only writer of the flag it is gated on, and pm skips that call
+// entirely while any NO_LIGHT_SLEEP lock is held. Otherwise: touch wake on
+// battery leaves BIT(GPIO) standing, the cable goes in, sleeps stop, and the
+// next tier-1 entry reads a months-old bit as a finger. Comparing against the
+// snapshot makes the whole check inert exactly when nothing sleeps — which is
+// also exactly when the latch cannot fail, since there is no resume to lose it.
 bool powerTouchWoke() {
   if (s_intFired) {
     return true;
   }
-  return s_intArmed && (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_GPIO)) != 0;
+  uint32_t causes = esp_sleep_get_wakeup_causes();
+  return s_intArmed && causes != s_causesAtArm && (causes & BIT(ESP_SLEEP_WAKEUP_GPIO)) != 0;
 }
 
 // `tpint arm|disarm` is a second writer to the pad, the wake bitmap and
