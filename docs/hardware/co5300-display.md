@@ -130,9 +130,11 @@ stays alive** — which is the entire reason wake-on-touch is possible at all.
 The settle that ships is `PANEL_SLPOUT_SETTLE_MS` in `main/panel.h`, **120 ms**,
 the datasheet-safe one — one constant, used as the default of the one runtime
 knob (`doze <0|1> [settle-ms]`, which drives the shipped path rather than a
-bench copy of it). A rouse also has to revive the digitiser, so the tier-1 wake
-is the 139 ms plus a TP_RESET pulse and the touch retry loop (~40–60 ms when the
-part answers at once, as it does after a rail-cut wake).
+bench copy of it). A rouse also has to revive the digitiser, so the shipped
+tier-1 wake is **220–221 ms measured** (10+ cycles, no variance): the 139 ms of
+panel plus ~81 ms of TP_RESET pulse and touch re-init. Against `panelWake()`'s
+**260 ms**, re-measured on the same binary — so the tier buys 40 ms of wake
+time and, far more to the point, a screen a finger can bring back at all.
 
 ## Waking is a full re-init — ~261 ms
 

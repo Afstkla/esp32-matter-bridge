@@ -106,9 +106,14 @@ brings the part back with a **TP_RESET-only pulse** — expander output register
 `0x01`: `0x07 → 0x03 → 0x07`, 20 ms each way, then the usual `touchInit()`
 retry loop. Clearing EXIO2 alone leaves DSI_PWR_EN and LCD_RESET high, so the
 digitiser restarts without the module's 261 ms cold start; `releaseResets()`
-(which drops all three) is the tier-2 path and stays that way. *Unverified on
-hardware — the pulse itself is what `sleep`/`wake` has always done, but never
-before with the other two bits held high.*
+(which drops all three) is the tier-2 path and stays that way.
+
+**Measured, 10+ cycles on our unit: it works.** `CST816 chip id 0xB7 after
+20 ms` on every rouse — one 20 ms retry, against `after 0 ms` for the rail-cut
+path, so a part coming out of standby by reset is marginally slower to answer
+than one coming up from cold. The whole rouse is **220–221 ms** at settle 120:
+139 ms of panel plus ~81 ms of digitiser (40 ms pulse, 20 ms retry, 20 ms
+post-`0xFA` settle). No failed revival in any cycle.
 
 Two rules follow from standby killing the I2C interface, and the firmware obeys
 both: `panelTouch()` is fenced off on `panelDozing()` so nothing polls a part
@@ -198,6 +203,29 @@ Two config caveats:
   is an RTC IO (the S3's RTC range is 0–21), so the
   `..._on_hp_periph_powerdown()` variant would be available if it ever matters.
 
+### `tpint drive 0` simulates a touch wake — and cannot simulate a stuck line
+
+Two bench facts, both learned the hard way and both worth having before
+designing a test around this pin.
+
+**Driving the line low while tier 1 is armed exercises the entire wake path**
+without a finger: the ISR latches (`tpint` reports `fired=1` in the same
+reply), the ui tick rouses, and `WAKE touch` follows. Measured end to end,
+three runs: **390–470 ms** from the drive to `WAKE touch`, of which 221 ms is
+the rouse and the rest is the polled latch waiting for the next 250 ms tick.
+Everything downstream of "INT goes low" is therefore machine-verifiable; the
+only thing a finger is still needed for is whether the CST820 asserts INT out
+of standby at all.
+
+**The refused-arm guard cannot be provoked from the SoC side.**
+`powerArmTouchWake()` opens with `openTpInt()`, whose `gpio_config()` resets the
+pad to plain input and so *releases the open-drain drive* before the level check
+reads it — `tpint drive 0` then `sleep` arms normally, with `level=1`. (This is
+the same effect that invalidated Task 1's first disarmed-held-low control.) The
+guard still protects against the case it was written for, a digitiser holding
+INT low with its own output, because nothing on the SoC side can release that.
+It just cannot be rehearsed on the bench.
+
 `tpint` is the bench instrument for all of this: level and armed state with no
 argument, `arm`/`disarm`, `drive <0|1|z>` to pull the line open-drain from the
 SoC side (open-drain, so it can never fight the digitiser), `scope <ms>` to
@@ -268,7 +296,10 @@ touch wake fires ~250 ms into the next tier-1 entry, and the "skip touch wake
 this cycle" fault becomes the wake loop the check was written to prevent.
 
 Because a 1 ms pulse has to survive a CPU-power-gated light sleep to reach that
-handler at all (`CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP` is on),
+handler at all (`CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP` is set — though on our
+unit it does not take: every boot logs `sleep: sleep_cpu_configure(236): Failed
+to enable CPU power down during light sleep`, so the CPU is *not* in fact power
+gated and the risk this insures against is not currently armed),
 `powerTouchWoke()` also reads `esp_sleep_get_wakeup_causes()` for
 `BIT(ESP_SLEEP_WAKEUP_GPIO)`. GPIO21 is the only GPIO wake source in this
 firmware, so that bit can only mean this pin. Two independent readings: without

@@ -338,7 +338,7 @@ transition; `power` reports which tier it is in as `screen=on|tier1|tier2`.
 | Panel | DISPOFF + SLPIN | DISPOFF, then unpowered |
 | Digitiser | standby (`0xFE = 0x00`), I2C off | unpowered |
 | Wake | **a finger** on the glass, or PWR | **PWR only** |
-| Cost of waking | ~200 ms typical — a 139 ms rouse (measured: 19 ms of commands around the 120 ms settle) plus a TP_RESET pulse and touch re-init; **the sum is not yet measured end to end**, and a digitiser that needs its full retry budget can take it to ~660 ms | **~261 ms** measured module cold start |
+| Cost of waking | **220 ms** measured — a 139 ms rouse (19 ms of commands around the 120 ms settle) plus ~81 ms of TP_RESET pulse and touch re-init. A digitiser needing its full retry budget could take it to ~660 ms; none has | **260 ms** measured module cold start |
 | Idle draw | ~150 µA by datasheet, **never measured** | the module contributes nothing |
 
 Tier 1 is what makes wake-on-touch possible: the digitiser stays powered, its
