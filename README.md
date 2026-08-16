@@ -166,7 +166,7 @@ port at a time.
 | `finder [on\|off\|identify]` | start or stop a finder session the way a controller would, or fire the 5 s Identify burst |
 | `micdump <ms>` | record from the onboard microphone and stream it as base64 (see below) — **debug surface** |
 | `qr` | toggle the pairing screen |
-| `idle N [T]` | blank the screen after N seconds, 0 to never; `T` sets how many seconds tier 1 then holds the rail up (0 = straight to the rail cut) |
+| `idle N [T]` | blank the screen after N seconds, 0 to never; `T` sets how many seconds tier 1 then holds the rail up. `T=0` still passes through a one-tick doze+arm before the rail cut — it is not a pre-tier-1 baseline |
 | `reset slots` | remove every accessory (restarts) |
 | `wifi` | which network the driver actually joined |
 | `pairing` | manual pairing code and QR payload |
