@@ -77,7 +77,7 @@ public:
   }
 
   void apply() {
-    if (!_wanted || panelAsleep()) {
+    if (!_wanted || panelDark()) {
       return;
     }
     _wanted = false;
@@ -167,7 +167,7 @@ private:
   // room, a flashing AMOLED says which cushion. Only while it is already awake
   // — see internalsFinding() for who wakes it.
   void pulse(uint32_t now) {
-    if (panelAsleep()) {
+    if (panelDark()) {
       return;
     }
     int8_t bright = (now / FINDER_PULSE_MS) % 2 == 0 ? 1 : 0;

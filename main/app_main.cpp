@@ -39,8 +39,32 @@ static volatile int16_t s_tapX = -1;
 static volatile int16_t s_tapY = 0;
 static volatile int16_t s_brightnessWanted = -1;
 static volatile int8_t s_sleepWanted = -1;  // 0 wake, 1 sleep
-static volatile int8_t s_dozeWanted = -1;   // 0 rouse, 1 doze
-static volatile uint32_t s_rouseSettleMs = 120;
+static volatile uint32_t s_rouseSettleMs = PANEL_SLPOUT_SETTLE_MS;
+
+// Commands record intent and the ui tick applies it, so the work — and the line
+// it prints — happen after the command has already returned. Waiting for the
+// tick that applies it is what keeps a command's output inside its own reply
+// instead of surfacing under whichever command comes next, which is what made
+// the first `doze` measurements read as if they were off by one.
+static volatile uint32_t s_requestsApplied = 0;
+
+static void awaitUi() {
+  uint32_t before = s_requestsApplied;
+  for (int i = 0; i < 200 && s_requestsApplied == before; i++) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// How long tier 1 holds the module's rail up after the screen goes dark. The
+// tier buys a fast touch wake for an idle draw nothing on this board can
+// measure — no current sense, no current ADC in the PMU — so the window is what
+// bounds the exposure to that unmeasured number. Grow it once a battery soak has
+// priced it (`battlog`), not before — and since that soak has to run on the live
+// Genie, where reflashing to change one number is the expensive part, `idle`
+// takes the window as a second argument for the length of a session.
+static const uint32_t TIER1_WINDOW_MS = 60000;
+static uint32_t s_tier1WindowMs = TIER1_WINDOW_MS;
+static uint32_t s_tier1StartedAt = 0;
 
 static uint32_t nowMs() {
   return (uint32_t)(esp_timer_get_time() / 1000);
@@ -149,6 +173,46 @@ static void showQr(bool on) {
   printf("SCREEN %s\n", on ? "qr" : "builder");
 }
 
+// The three transitions between the screen's states, and the only places a wake
+// source is armed. Every one of them runs on the ui task: the panel, the
+// expander and the light-sleep wake bitmap are all single-writer state, and the
+// ui task is that writer.
+//
+// Tier 1 leaves the module powered with the panel in SLPIN and the digitiser in
+// standby, so a finger wakes the screen through the INT line. Tier 2 is what the
+// firmware did before wake-on-touch: rail down, PWR key only.
+static void enterTier1() {
+  panelDoze();
+  powerArmTouchWake(true);
+  s_tier1StartedAt = nowMs();
+  printf("SLEEP tier=1\n");
+}
+
+static void enterTier2() {
+  powerArmTouchWake(false);
+  panelSleep();
+  printf("SLEEP tier=2\n");
+}
+
+// Disarm first: the wake source has done its job and a level trigger left armed
+// against a line the digitiser is about to drive is a wake loop. A rouse that
+// fails leaves the rail down, which is what the panelAsleep() branch then picks
+// up — the cold start is the tier-1 failure path, not a separate one.
+static void wakeScreen() {
+  powerArmTouchWake(false);
+  if (panelDozing()) {
+    panelRouse(s_rouseSettleMs);
+  }
+  if (panelAsleep()) {
+    panelWake();
+  }
+  // Without this the idle timer is still expired and the next tick puts the
+  // screen straight back to sleep. The framebuffer was blanked on the way down,
+  // so waking also has to redraw.
+  noteActivity();
+  drawScreen();
+}
+
 static void runSwipe(int8_t direction) {
   uint32_t at = nowMs();
   builderSwipe(direction);
@@ -170,9 +234,8 @@ static void pollKeys() {
     internalsFinderStop();
     return;
   }
-  if (panelAsleep()) {
-    panelWake();
-    drawScreen();
+  if (panelDark()) {
+    wakeScreen();
     return;
   }
   builderNudgeLevel(up ? 1 : -1);
@@ -190,9 +253,8 @@ static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
     internalsFinderStop();
     return;
   }
-  if (panelAsleep()) {
-    panelWake();
-    drawScreen();
+  if (panelDark()) {
+    wakeScreen();
     return;
   }
 
@@ -219,6 +281,13 @@ static void handleRelease(int16_t x0, int16_t y0, int16_t x, int16_t y) {
   }
 }
 
+// Tier 1 wakes on the INT line rather than on a touch report — the digitiser has
+// no I2C interface in standby — so by the time it can be read, the finger that
+// woke the device is already on the glass and its release is the wake. Swallowed
+// here, and only until the glass goes quiet, so a finger lifted before the
+// digitiser came back never eats the next real tap.
+static bool s_swallowRelease = false;
+
 static void pollTouch() {
   static bool wasDown = false;
   static int16_t downX = 0, downY = 0;
@@ -239,9 +308,30 @@ static void pollTouch() {
   } else if (wasDown && nowMs() - lastAt > 120) {
     lastAt = nowMs();
     noteActivity();
-    handleRelease(downX, downY, lastX, lastY);
+    if (s_swallowRelease) {
+      s_swallowRelease = false;
+    } else {
+      handleRelease(downX, downY, lastX, lastY);
+    }
+  } else if (!wasDown) {
+    s_swallowRelease = false;
   }
   wasDown = down;
+}
+
+// The other half of tier 1: the latch the INT handler sets, read on the tick the
+// wake itself brought forward.
+//
+// ponytail: polled, so a touch costs up to one asleep tick (250 ms) before the
+// rouse even starts. A task notification from the handler would take that to
+// zero — worth it if the measured wake ever feels slow, and not before.
+static void pollTouchWake() {
+  if (!panelDozing() || !powerTouchWoke()) {
+    return;
+  }
+  wakeScreen();
+  s_swallowRelease = true;
+  printf("WAKE touch\n");
 }
 
 // A dark device is a hard device to find, so a finder session asks for the
@@ -252,13 +342,15 @@ static void pollTouch() {
 static void pollFinder() {
   static bool wasFinding = false;
   bool finding = internalsFinding();
-  if (finding && !wasFinding && panelAsleep()) {
+  if (finding && !wasFinding && panelDark()) {
     s_sleepWanted = 0;
   }
   wasFinding = finding;
 }
 
 static void pollRequests() {
+  bool applied = s_brightnessWanted >= 0 || s_sleepWanted >= 0 || s_swipeWanted != 0 ||
+                 s_qrToggleWanted || s_tapX >= 0;
   if (s_brightnessWanted >= 0) {
     uint8_t level = (uint8_t)s_brightnessWanted;
     s_brightnessWanted = -1;
@@ -269,29 +361,11 @@ static void pollRequests() {
     bool wantsSleep = s_sleepWanted == 1;
     s_sleepWanted = -1;
     if (wantsSleep) {
-      panelSleep();
-      printf("SLEEP\n");
+      enterTier1();
     } else {
-      panelWake();
-      // Without this the idle timer is still expired and the next tick puts the
-      // screen straight back to sleep. The framebuffer was blanked on the way
-      // down, so waking also has to redraw.
-      noteActivity();
-      drawScreen();
-      printf("%s\n", panelAsleep() ? "WAKE failed" : "WAKE");
+      wakeScreen();
+      printf("%s\n", panelDark() ? "WAKE failed" : "WAKE");
     }
-  }
-  if (s_dozeWanted >= 0) {
-    bool wantsDoze = s_dozeWanted == 1;
-    s_dozeWanted = -1;
-    if (wantsDoze) {
-      panelDoze();
-    } else {
-      panelRouse(s_rouseSettleMs);
-      noteActivity();
-      drawScreen();
-    }
-    printf("DOZE %d\n", panelDozing() ? 1 : 0);
   }
   if (s_swipeWanted != 0) {
     int8_t direction = s_swipeWanted;
@@ -308,20 +382,23 @@ static void pollRequests() {
     noteActivity();
     handleRelease(x, y, x, y);
   }
+  if (applied) {
+    s_requestsApplied = s_requestsApplied + 1;
+  }
 }
 
 // The screen shows both, and neither raises anything the ui task hears about.
 // Half a second is the same cadence the Arduino build polled the stack at.
 //
-// Nothing to poll for while the screen is off: the panel is unpowered, the
-// redraw this would trigger goes nowhere, and every wake path redraws anyway.
-// netStatus() is a WiFi API call, so this is also the one place the ui task
-// touches the radio on a fixed cadence.
+// Nothing to poll for while the screen is off in either tier: the redraw this
+// would trigger goes nowhere, and every wake path redraws anyway. netStatus() is
+// a WiFi API call, so this is also the one place the ui task touches the radio
+// on a fixed cadence.
 static void pollState() {
   static uint32_t lastAt = 0;
   static bool lastCommissioned = false;
   static bool lastOnline = false;
-  if (panelAsleep() || nowMs() - lastAt < 500) {
+  if (panelDark() || nowMs() - lastAt < 500) {
     return;
   }
   lastAt = nowMs();
@@ -343,10 +420,8 @@ static void pollState() {
 // between ticks: dropping to four passes a second is what lets tickless idle
 // find a sleep worth taking. The cost is anything shorter than a tick: a quick
 // BOOT press can fall between two polls, so waking the screen sometimes takes a
-// second try. The power key is exempt — its PMU interrupt latches, so a press
-// waits for whenever the poll gets there, and it is the wake to use: the
-// digitiser is unpowered with the panel (see panelSleep), so touch cannot wake
-// the device at all.
+// second try. The other two wakes are latched and so cannot be missed — the
+// power key by the PMU's interrupt, a touch in tier 1 by the INT handler.
 static const uint32_t TICK_AWAKE_MS = 20;
 static const uint32_t TICK_ASLEEP_MS = 250;
 
@@ -365,16 +440,19 @@ static void uiTask(void *) {
     internalsPoll();
     powerPoll();
     pollKeys();
+    pollTouchWake();
     pollTouch();
     if (builderNeedsRedraw()) {
       drawScreen();
     }
-    if (!panelAsleep() && s_idleTimeoutMs > 0 && nowMs() - s_lastActivityAt > s_idleTimeoutMs) {
-      panelSleep();
-      printf("SLEEP\n");
+    if (!panelDark() && s_idleTimeoutMs > 0 && nowMs() - s_lastActivityAt > s_idleTimeoutMs) {
+      enterTier1();
+    }
+    if (panelDozing() && nowMs() - s_tier1StartedAt > s_tier1WindowMs) {
+      enterTier2();
     }
     esp_task_wdt_reset();
-    vTaskDelay(pdMS_TO_TICKS(panelAsleep() ? TICK_ASLEEP_MS : TICK_AWAKE_MS));
+    vTaskDelay(pdMS_TO_TICKS(panelDark() ? TICK_ASLEEP_MS : TICK_AWAKE_MS));
   }
 }
 
@@ -457,6 +535,7 @@ static int cmdSwipe(int argc, char **argv) {
     return 1;
   }
   s_swipeWanted = strcasecmp(argv[1], "left") == 0 ? 1 : -1;
+  awaitUi();
   return 0;
 }
 
@@ -469,6 +548,7 @@ static int cmdTap(int argc, char **argv) {
   }
   s_tapY = (int16_t)strtol(argv[2], nullptr, 10);
   s_tapX = (int16_t)strtol(argv[1], nullptr, 10);
+  awaitUi();
   return 0;
 }
 
@@ -477,21 +557,25 @@ static int cmdBright(int argc, char **argv) {
     return 1;
   }
   s_brightnessWanted = (int16_t)std::clamp(strtol(argv[1], nullptr, 10), 0L, 255L);
+  awaitUi();
   return 0;
 }
 
 static int cmdSleep(int argc, char **argv) {
   s_sleepWanted = 1;
+  awaitUi();
   return 0;
 }
 
 static int cmdWake(int argc, char **argv) {
   s_sleepWanted = 0;
+  awaitUi();
   return 0;
 }
 
-// The rail-up counterpart of `sleep`/`wake`, kept as its own command so the two
-// costs can be measured against each other on one binary.
+// `sleep`/`wake` with the SLPOUT settle exposed, so what a settle bisect
+// measures is the shipped path rather than a bench-only copy of it. The value
+// sticks for the session; a reboot goes back to PANEL_SLPOUT_SETTLE_MS.
 static int cmdDoze(int argc, char **argv) {
   if (argc < 2 || (strcmp(argv[1], "0") != 0 && strcmp(argv[1], "1") != 0)) {
     printf("ERR usage: doze <0|1> [settle-ms]\n");
@@ -500,7 +584,8 @@ static int cmdDoze(int argc, char **argv) {
   if (argc == 3) {
     s_rouseSettleMs = (uint32_t)strtoul(argv[2], nullptr, 10);
   }
-  s_dozeWanted = argv[1][0] - '0';
+  s_sleepWanted = argv[1][0] - '0';
+  awaitUi();
   return 0;
 }
 
@@ -518,16 +603,25 @@ static int cmdSlots(int argc, char **argv) {
 
 static int cmdQr(int argc, char **argv) {
   s_qrToggleWanted = true;
+  awaitUi();
   return 0;
 }
 
+// The second argument is how long tier 1 then holds the rail up: 0 cuts it
+// straight away (the pre-wake-on-touch behaviour), and a long one is what a
+// drain soak of tier 1 needs.
 static int cmdIdle(int argc, char **argv) {
-  if (!wantArgs(argc, 2, "idle <seconds>")) {
+  if (argc < 2 || argc > 3) {
+    printf("ERR usage: idle <seconds> [tier1-seconds]\n");
     return 1;
   }
   s_idleTimeoutMs = (uint32_t)strtoul(argv[1], nullptr, 10) * 1000;
+  if (argc == 3) {
+    s_tier1WindowMs = (uint32_t)strtoul(argv[2], nullptr, 10) * 1000;
+  }
   noteActivity();
-  printf("IDLE %u\n", (unsigned)(s_idleTimeoutMs / 1000));
+  printf("IDLE %u tier1=%u\n", (unsigned)(s_idleTimeoutMs / 1000),
+         (unsigned)(s_tier1WindowMs / 1000));
   return 0;
 }
 
@@ -552,12 +646,15 @@ static void registerCommands() {
   consoleRegisterCmd("tap", "Inject a tap at <x> <y>", cmdTap);
   consoleRegisterCmd("slots", "List the accessories in use", cmdSlots);
   consoleRegisterCmd("bright", "Set panel brightness 0-255", cmdBright);
-  consoleRegisterCmd("sleep", "Blank the screen", cmdSleep);
+  consoleRegisterCmd("sleep", "Blank the screen (tier 1: rail up, touch wakes it)", cmdSleep);
   consoleRegisterCmd("wake", "Unblank the screen and redraw", cmdWake);
-  consoleRegisterCmd("doze", "Blank the screen with SLPIN, rail up: doze <0|1> [settle-ms]",
+  consoleRegisterCmd("doze", "sleep/wake with the SLPOUT settle exposed: doze <0|1> [settle-ms]",
                      cmdDoze);
   consoleRegisterCmd("qr", "Toggle the pairing screen", cmdQr);
-  consoleRegisterCmd("idle", "Blank the screen after <seconds>, 0 to never", cmdIdle);
+  consoleRegisterCmd("idle",
+                     "Blank the screen after <seconds>, 0 to never; [tier1-seconds] sets how "
+                     "long the rail then stays up for touch wake",
+                     cmdIdle);
   consoleRegisterCmd("reset", "reset slots: clear the layout and restart", cmdReset);
 }
 

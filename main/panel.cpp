@@ -54,10 +54,17 @@ static const uint32_t QSPI_CMD_BRIGHTNESS = (0x02u << 24) | (0x51u << 8);
 // out as raw command words like the brightness register does.
 static const uint32_t QSPI_CMD_SLPIN = (0x02u << 24) | (0x10u << 8);
 static const uint32_t QSPI_CMD_SLPOUT = (0x02u << 24) | (0x11u << 8);
-// The CO5300 datasheet allows SLPOUT 120 ms to settle before the next sleep
-// command; the vendor init sequence waits 60. Left as an argument because the
-// difference is the whole point of the measurement.
-static const uint32_t SLPOUT_SETTLE_MS = 120;
+
+// TCA9554 output register 0x01: EXIO0 = LCD_RESET, EXIO1 = DSI_PWR_EN,
+// EXIO2 = TP_RESET.
+static const uint8_t EXIO_ALL_HIGH = 0x07;
+static const uint8_t EXIO_TP_RESET = 0x04;
+
+// 0xFE is the digitiser's DisAutoSleep: non-zero (0x01 out of reset) means it
+// will never enter standby on its own, which is why nothing here had ever seen
+// this part go quiet. Writing 0 drops it into standby within one transaction and
+// takes its I2C interface with it.
+static const uint8_t TOUCH_REG_DIS_AUTOSLEEP = 0xFE;
 
 static esp_lcd_panel_io_handle_t s_io = nullptr;
 static esp_lcd_panel_handle_t s_panel = nullptr;
@@ -80,7 +87,7 @@ static esp_err_t releaseResets() {
   ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x03, 0xF8), TAG, "expander direction");
   ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x01, 0x00), TAG, "expander low");
   vTaskDelay(pdMS_TO_TICKS(20));
-  ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x01, 0x07), TAG, "expander high");
+  ESP_RETURN_ON_ERROR(i2cWriteReg(s_tca, 0x01, EXIO_ALL_HIGH), TAG, "expander high");
   vTaskDelay(pdMS_TO_TICKS(20));
   return ESP_OK;
 }
@@ -99,18 +106,41 @@ static void cutPower() {
 // bit 4 (motion) is what Arduino_DriveBus writes, and it is the difference
 // between frozen coordinate registers and a working digitiser. The chip also
 // needs a few hundred ms after reset before it answers at all.
-static void touchInit() {
+static bool touchInit() {
   uint8_t id = 0;
   for (int attempt = 0; attempt < 25; attempt++) {
     if (i2cReadReg(s_touch, 0xA7, &id, 1) == ESP_OK) {
       ESP_LOGI(TAG, "CST816 chip id 0x%02X after %d ms", id, attempt * 20);
       ESP_ERROR_CHECK_WITHOUT_ABORT(i2cWriteReg(s_touch, 0xFA, 0x10));
       vTaskDelay(pdMS_TO_TICKS(20));
-      return;
+      return true;
     }
     vTaskDelay(pdMS_TO_TICKS(20));
   }
   ESP_LOGE(TAG, "no touch response at 0x15");
+  return false;
+}
+
+// Standby is what makes the digitiser cheap enough to leave powered, and it is
+// one write. The chip stops answering immediately — this write may itself be the
+// last transaction it acknowledges — so nothing may poll it until it is back.
+static void touchStandby() {
+  ESP_ERROR_CHECK_WITHOUT_ABORT(i2cWriteReg(s_touch, TOUCH_REG_DIS_AUTOSLEEP, 0x00));
+}
+
+// The only way back. A part in standby has no I2C interface, so writing
+// DisAutoSleep to 0x01 cannot reach it — the reset line can, and TP_RESET is the
+// one expander bit that moves without touching the module's supply.
+static bool touchRevive() {
+  if (i2cWriteReg(s_tca, 0x01, EXIO_ALL_HIGH & ~EXIO_TP_RESET) != ESP_OK) {
+    return false;
+  }
+  vTaskDelay(pdMS_TO_TICKS(20));
+  if (i2cWriteReg(s_tca, 0x01, EXIO_ALL_HIGH) != ESP_OK) {
+    return false;
+  }
+  vTaskDelay(pdMS_TO_TICKS(20));
+  return touchInit();
 }
 
 // esp_lcd fires this once per frame, on the last chunk of the transfer.
@@ -211,6 +241,10 @@ bool panelAsleep() {
   return s_asleep;
 }
 
+bool panelDark() {
+  return s_asleep || s_dozing;
+}
+
 // Brightness 0 is not off: the CO5300 keeps its charge pump running for
 // ELVDD/ELVSS whatever it is showing, and this firmware used to leave DSI_PWR_EN
 // high for the device's whole life. Cutting VCI is worth tens of mA — the
@@ -222,10 +256,10 @@ bool panelAsleep() {
 // SLPIN would be a raw QSPI command, and it saves nothing once VCI is gone and
 // the reset lines are low.
 //
-// ponytail: the CST816 shares this rail, so touch dies with the panel and the
-// PWR key is the only wake. Task #22 (wake on touch) would have to either keep
-// the rail up — which is most of this saving — or open a timed window; both
-// start from cutPower()/releaseResets() being the only pair that moves it.
+// The CST816 shares this rail, so touch dies with the panel and the PWR key is
+// the only wake: this is tier 2, and the tier-1 window in app_main.cpp is what
+// bounds how long the device waits before taking it. Reachable from tier 1, in
+// which case the panel is already dark and only the rail is left to drop.
 void panelSleep() {
   if (s_asleep) {
     return;
@@ -235,6 +269,7 @@ void panelSleep() {
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, false));
   vTaskDelay(pdMS_TO_TICKS(20));
   cutPower();
+  s_dozing = false;
   s_asleep = true;
 }
 
@@ -265,10 +300,11 @@ void panelWake() {
   ESP_LOGI(TAG, "panel wake took %u ms", (unsigned)((esp_timer_get_time() - startedAt) / 1000));
 }
 
-// The other way to darken the screen: VCI stays up, the controller goes into
-// SLPIN, and the CST820 on the same rail keeps scanning — which is what makes
-// wake-on-touch possible at all. Measured against panelSleep()/panelWake() to
-// price the tier; the ui task owns both pairs.
+// Tier 1: VCI stays up, the controller goes into SLPIN and the CST820 on the
+// same rail into standby, which is what leaves the INT line free to wake the
+// device. Nothing may poll the digitiser from here until touchRevive() has run —
+// standby takes its I2C interface with it, and panelTouch() is fenced off on
+// s_dozing for exactly that reason.
 bool panelDozing() {
   return s_dozing;
 }
@@ -284,22 +320,39 @@ void panelDoze() {
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, false));
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(s_io, QSPI_CMD_SLPIN, nullptr, 0));
   s_dozing = true;
+  touchStandby();
   ESP_LOGI(TAG, "panel doze took %u ms", (unsigned)((esp_timer_get_time() - startedAt) / 1000));
 }
 
 // No SWRESET, no MADCTL/COLMOD, no vendor sequence: the controller kept its
-// configuration and its GRAM, so the whole cost is the SLPOUT settle.
+// configuration and its GRAM, so the panel's whole cost is the SLPOUT settle and
+// the digitiser's is a reset pulse.
+//
+// The failure story is the state it leaves behind rather than a return code: a
+// controller that will not come out of SLPIN, or a digitiser that does not
+// answer after its reset, drops the rail and lands in tier 2 — where the
+// caller's panelWake() cold start is waiting. A lit screen with a dead
+// digitiser would be the worse outcome, since touch is the point of the tier.
 void panelRouse(uint32_t settleMs) {
   if (!s_dozing) {
     return;
   }
   int64_t startedAt = esp_timer_get_time();
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(s_io, QSPI_CMD_SLPOUT, nullptr, 0));
-  vTaskDelay(pdMS_TO_TICKS(settleMs));
-  s_dozing = false;
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, true));
-  panelFlush();
-  panelBrightness(PANEL_ON_BRIGHTNESS);
+  esp_err_t err = esp_lcd_panel_io_tx_param(s_io, QSPI_CMD_SLPOUT, nullptr, 0);
+  if (err == ESP_OK) {
+    vTaskDelay(pdMS_TO_TICKS(settleMs));
+    s_dozing = false;
+    err = esp_lcd_panel_disp_on_off(s_panel, true);
+    panelFlush();
+    panelBrightness(PANEL_ON_BRIGHTNESS);
+  }
+  if (err != ESP_OK || !touchRevive()) {
+    ESP_LOGE(TAG, "panel rouse failed, dropping the rail for a cold start");
+    cutPower();
+    s_dozing = false;
+    s_asleep = true;
+    return;
+  }
   ESP_LOGI(TAG, "panel rouse took %u ms (settle %u)",
            (unsigned)((esp_timer_get_time() - startedAt) / 1000), (unsigned)settleMs);
 }
@@ -407,7 +460,7 @@ void panelTouchDump(uint32_t durationMs) {
 }
 
 bool panelTouch(int16_t *x, int16_t *y) {
-  if (s_asleep) {
+  if (panelDark()) {
     return false;
   }
   uint8_t report[5];
@@ -461,11 +514,12 @@ static int cmdScreendump(int argc, char **argv) {
   return 0;
 }
 
-// Which registers this part actually has is an open question: the generic
-// CST816S map has already been caught claiming one (0xFE) that is not here, and
-// the low-power commands all live in that unverified half of the map. Reading
-// the whole space is the only honest way to find out which addresses answer —
-// a NAK prints as `--`, so the gaps are as informative as the values.
+// Every address on this part ACKs, so a `--` here never means "no such
+// register" — it means the chip is not listening, which is what standby looks
+// like from the bus. Reading the whole space is still the only honest way to
+// find out what a register does: 0xFA reads back 0x70 whatever is written to it,
+// and 0xFE was written off as absent for a whole investigation on the strength
+// of one NAK it produced by working (see docs/hardware/cst820-touch.md).
 static int cmdTouchreg(int argc, char **argv) {
   if (argc == 3) {
     uint8_t reg = (uint8_t)strtoul(argv[1], nullptr, 0);

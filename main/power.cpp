@@ -6,6 +6,7 @@
 #include <strings.h>
 
 #include "driver/gpio.h"
+#include "esp_log.h"
 #include "esp_pm.h"
 #include "esp_private/wifi.h"
 #include "esp_sleep.h"
@@ -16,6 +17,8 @@
 #include "console.h"
 #include "keys.h"
 #include "panel.h"
+
+static const char *TAG = "power";
 
 // WiFi modem sleep is the single biggest saving available here: the radio idles
 // between beacons instead of listening continuously. "max" waits for the
@@ -148,6 +151,20 @@ static bool setWifiPs(const char *mode) {
   return true;
 }
 
+// TP_INT from the CST820, idle-high through an off-chip 10 kΩ pull-up to
+// VCC3V3. It lives here rather than in panel.cpp because what it drives is the
+// sleep plumbing, not the digitiser.
+static const gpio_num_t PIN_TP_INT = GPIO_NUM_21;
+static bool s_intArmed = false;
+static volatile bool s_intFired = false;
+
+// Which tier the screen is in, and whether the touch wake is armed, are the two
+// states a wake-on-touch session needs to see and neither is visible from
+// outside: the glass is black in both tiers.
+static const char *screenState() {
+  return panelDozing() ? "tier1" : panelAsleep() ? "tier2" : "on";
+}
+
 static void report() {
   wifi_ps_type_t ps = WIFI_PS_NONE;
   esp_wifi_get_ps(&ps);
@@ -156,10 +173,11 @@ static void report() {
   wifi_mode_t mode = WIFI_MODE_NULL;
   esp_wifi_get_mode(&mode);
   printf("POWER dfs=%d-%dMHz light_sleep=%d usb_lock=%d usbsim=%d wifi_ps=%s active=%ums "
-         "wifi_mode=%s flush=%.1fms underflows=%u\n",
+         "wifi_mode=%s screen=%s touchwake=%d flush=%.1fms underflows=%u\n",
          pm.min_freq_mhz, pm.max_freq_mhz, pm.light_sleep_enable ? 1 : 0, s_awakeHeld ? 1 : 0,
          s_pretendBattery ? 1 : 0, psName(ps), (unsigned)s_minActiveMs, modeName(mode),
-         panelLastFlushUs() / 1000.0, (unsigned)panelUnderflows());
+         screenState(), s_intArmed ? 1 : 0, panelLastFlushUs() / 1000.0,
+         (unsigned)panelUnderflows());
   pmuReport();
 }
 
@@ -188,12 +206,6 @@ static void configure(int maxMhz, int minMhz, bool lightSleep) {
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_pm_configure(&pm));
 }
 
-// TP_INT from the CST820, idle-high through an off-chip 10 kΩ pull-up to
-// VCC3V3. It lives here rather than in panel.cpp because what this probe
-// measures is the sleep plumbing, not the digitiser.
-static const gpio_num_t PIN_TP_INT = GPIO_NUM_21;
-static bool s_intArmed = false;
-
 // Nothing has ever configured this pad, and an unconfigured ESP32-S3 GPIO has
 // its input buffer off — gpio_get_level() then reports 0 whatever the wire is
 // doing, which reads exactly like a line stuck low.
@@ -204,21 +216,56 @@ static void openTpInt() {
   ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
 }
 
+// The wake source alone only shortens a light sleep — it does not tell the ui
+// task anything, and the digitiser's INT pulse is a millisecond wide against a
+// 250 ms tick, so the line has to be latched in hardware. This is that latch.
+//
+// It masks itself because the trigger is a level: gpio_intr_disable() clears the
+// pin's interrupt enable and nothing else — the low-level trigger and the wakeup
+// bit both survive it — so the wake source stays live until the ui task disarms
+// it, and one INT pulse produces exactly one handler call instead of a storm for
+// as long as the line stays down.
+static void onTpInt(void *) {
+  s_intFired = true;
+  gpio_intr_disable(PIN_TP_INT);
+}
+
 // gpio_wakeup_enable() is also what exempts the pin from
 // CONFIG_PM_SLP_DISABLE_GPIO, which is on (selected by the light-sleep GPIO
 // reset workaround) and isolates every other pad on the way into automatic
 // sleep. Arming by hand through rtc_gpio_wakeup_enable() would skip that and
 // the pin would be deaf.
-static void armTpInt(bool on) {
+void powerArmTouchWake(bool on) {
   openTpInt();
   if (on) {
+    // Arming against a line already at its trigger level fires the handler at
+    // once, and the screen would wake, idle out and re-arm in a loop for as long
+    // as the line stayed down. INT idles high with the digitiser awake, in
+    // standby and unpowered alike, so a low line here is a fault — and going
+    // without touch wake for this cycle is the safe reading of it. The tier-1
+    // window still expires into the rail cut.
+    if (gpio_get_level(PIN_TP_INT) == 0) {
+      ESP_LOGW(TAG, "TP_INT already low, leaving touch wake disarmed");
+      s_intArmed = false;
+      return;
+    }
+    s_intFired = false;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(PIN_TP_INT, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
+    // Adding the handler is also what re-enables the interrupt the last INT
+    // pulse masked.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_add(PIN_TP_INT, onTpInt, nullptr));
   } else {
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_intr_disable(PIN_TP_INT));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_remove(PIN_TP_INT));
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_disable(PIN_TP_INT));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO));
   }
   s_intArmed = on;
+}
+
+bool powerTouchWoke() {
+  return s_intFired;
 }
 
 // Open drain, so the bench can pull the line low exactly as the digitiser does
@@ -304,16 +351,21 @@ static void scopeTpInt(uint32_t ms) {
          (unsigned)low, (unsigned)falls);
 }
 
+static void reportTpInt() {
+  printf("TPINT level=%d armed=%d fired=%d\n", gpio_get_level(PIN_TP_INT), s_intArmed ? 1 : 0,
+         s_intFired ? 1 : 0);
+}
+
 static int cmdTpint(int argc, char **argv) {
   if (argc == 1) {
-    printf("TPINT level=%d armed=%d\n", gpio_get_level(PIN_TP_INT), s_intArmed ? 1 : 0);
+    reportTpInt();
     reportWatch();
     return 0;
   }
   if (argc == 2 && strcasecmp(argv[1], "arm") == 0) {
-    armTpInt(true);
+    powerArmTouchWake(true);
   } else if (argc == 2 && strcasecmp(argv[1], "disarm") == 0) {
-    armTpInt(false);
+    powerArmTouchWake(false);
   } else if (argc == 3 && strcasecmp(argv[1], "drive") == 0) {
     if (!driveTpInt(argv[2])) {
       printf("ERR usage: tpint drive <0|1|z>\n");
@@ -329,7 +381,7 @@ static int cmdTpint(int argc, char **argv) {
     printf("ERR usage: tpint [arm|disarm|drive <0|1|z>|scope <ms>|watch <ms>]\n");
     return 1;
   }
-  printf("TPINT level=%d armed=%d\n", gpio_get_level(PIN_TP_INT), s_intArmed ? 1 : 0);
+  reportTpInt();
   return 0;
 }
 
@@ -435,6 +487,9 @@ void powerBegin() {
                      "minimum active time, 'usbsim on|off' fakes the cable being out (debug)",
                      cmdPower);
   openTpInt();
+  // The touch wake needs a handler, not just a wake source: waking the chip only
+  // shortens a light sleep, and the ui task has to hear about it.
+  ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_install_isr_service(0));
   consoleRegisterCmd("tpint",
                      "Touch INT (GPIO21) wake probe: no args reads the line, 'arm'|'disarm' the "
                      "light-sleep wake source, 'drive <0|1|z>' pulls it open-drain, 'scope <ms>' "
