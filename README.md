@@ -161,6 +161,7 @@ port at a time.
 | `tap X Y` | inject a tap at a coordinate |
 | `bright 0-255` | set panel brightness |
 | `sleep` / `wake` | power the display module down / back up and redraw |
+| `doze <0\|1> [settle-ms]` | blank the screen with SLPIN, panel rail left up — 29 ms down, 139 ms back against `wake`'s 261 ms — **debug surface** |
 | `beep [on\|off]` | beep every 1.72 seconds until told to stop, or report the state |
 | `finder [on\|off\|identify]` | start or stop a finder session the way a controller would, or fire the 5 s Identify burst |
 | `micdump <ms>` | record from the onboard microphone and stream it as base64 (see below) — **debug surface** |
@@ -172,8 +173,10 @@ port at a time.
 | `window` | reopen a 3-minute commissioning window without unpairing |
 | `decommission` | erase all fabrics and restart |
 | `touchdump <ms>` | stream touch register changes |
+| `touchreg [<reg> [<value>]]` | dump the CST820's whole register map, or read/write one — **debug surface** |
 | `screendump` | stream the framebuffer as base64 (see below) |
 | `power [locks\|timers\|rails\|on\|off\|80\|160\|240\|active <ms>\|usbsim on\|off]` | power management tuning and drain instrumentation — **debug surface** |
+| `tpint [arm\|disarm\|drive <0\|1\|z>\|scope <ms>\|watch <ms>]` | the touch INT line (GPIO21) and its light-sleep wake source — read the level, arm the wake, pull the line open-drain, sample it every ms, or run a battery-simulated window and count what woke the chip — **debug surface** |
 | `ps none\|min\|max` | set WiFi power save mode |
 | `battlog` | dump the battery drain log, oldest first |
 | `bt` | backtrace every task — **debug surface**, names the line a wedged task is parked on |
@@ -480,8 +483,8 @@ still true from it is folded in below. Longer background on the Matter-side
 items: [docs/matter-notes.md](docs/matter-notes.md).
 
 - **Only the ui task may touch the panel or the framebuffer.** Console
-  commands that affect the screen (`bright`, `sleep`, `wake`, `swipe`, `qr`,
-  `tap`) set an intent that the ui task's own tick applies; nothing calls
+  commands that affect the screen (`bright`, `sleep`, `wake`, `doze`, `swipe`,
+  `qr`, `tap`) set an intent that the ui task's own tick applies; nothing calls
   `panelFlush` from the REPL task. Two tasks racing to flush left a
   done-semaphore counting frames nobody was waiting on.
 - **The QSPI clock is 40 MHz, not 80.** 80 MHz underflows the DMA once the

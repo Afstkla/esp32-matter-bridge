@@ -203,7 +203,10 @@ The only variable is the line level. A level-triggered source already sitting
 at its trigger level does not wake the chip repeatedly — it makes the hardware
 *refuse* to sleep, and IDF builds that reject mask from the very same bitmap:
 `reject_triggers = s_config.wakeup_triggers & RTC_SLEEP_REJECT_MASK`, and
-`RTC_GPIO_TRIG_EN` is in that mask (`esp_private/esp_pmu.h`). The automatic
+`RTC_GPIO_TRIG_EN` is in that mask. The mask that compiles for this chip is
+the one in `esp_hw_support/port/esp32s3/include/soc/rtc.h:677,694` — *not* the
+copy in `esp_private/esp_pmu.h`, which is gated `#if SOC_PMU_SUPPORTED` and
+the S3 does not define that. The automatic
 path adds its own timer source on top and calls the same
 `esp_light_sleep_start()` (`pm_impl.c`'s `vApplicationSleep`), clearing
 nothing. So the GPIO source is armed, live and evaluated on the automatic path.
