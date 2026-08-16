@@ -81,6 +81,52 @@ the rail stays up.
 Sleep order that works: black the framebuffer, brightness 0, DISPOFF, 20 ms
 settle (the module's decoupling bleeding down), then drop the expander bit.
 
+### The driver has no sleep call, and the API it would use is left null
+
+`esp_lcd` defines a `disp_sleep` panel op and exports
+`esp_lcd_panel_disp_sleep()`, but `espressif/esp_lcd_co5300` never assigns it
+— `esp_lcd_co5300_spi.c` wires up `disp_on_off` (DISPON `0x29` / DISPOFF
+`0x28`) and nothing else, so `esp_lcd_panel_disp_sleep()` returns
+`ESP_ERR_NOT_SUPPORTED`. SLPIN and SLPOUT go out as raw command words the same
+way brightness does:
+
+```c
+static const uint32_t QSPI_CMD_SLPIN  = (0x02u << 24) | (0x10u << 8);
+static const uint32_t QSPI_CMD_SLPOUT = (0x02u << 24) | (0x11u << 8);
+```
+
+There is no readback: `panel_io_spi_rx_param()` sends its command phase
+single-line and never sets the quad flags, so RDDPM (`0x0A`) cannot be used to
+confirm the sleep bit on a QSPI panel. **Whether the picture comes back
+correctly is an eyes-on check, not a machine-checkable one.**
+
+### Rail-up sleep measured: 29 ms down, 139 ms back
+
+`panelDoze()` / `panelRouse(settleMs)` are the rail-up pair — black frame,
+brightness 0, DISPOFF, SLPIN on the way down; SLPOUT, settle, DISPON, flush,
+brightness on the way back. `doze <0|1> [settle-ms]` drives them. Measured on
+our unit, same binary, same session:
+
+| Path | Cost |
+|---|---|
+| `panelDoze()` | **29 ms** (one 18 ms black flush plus two commands) |
+| `panelRouse(120)` | **139 ms** — the datasheet-safe settle |
+| `panelRouse(60)` | **79 ms** — the settle the vendor init sequence itself uses after `0x11` |
+| `panelRouse(5)` | **24 ms** |
+| `panelWake()` (rail cut, full re-init) | **260–261 ms** |
+
+The fixed cost of the rouse is **19 ms**; everything above that is the settle,
+which is the only knob. So the honest headline is **139 ms vs 261 ms — 122 ms
+saved, 1.9×** at the settle the datasheet allows, and 3.3× if 60 ms turns out
+to be enough. **The short settles are unverified visually** — timing says the
+commands went out, nothing here says the panel came back clean at 5 ms. Bisect
+the settle with eyes on the screen before shipping anything below 120.
+
+What is genuinely cheaper about this path is not the 122 ms. It is that VCI
+never drops, so the controller keeps its configuration and its GRAM, no
+SWRESET/MADCTL/COLMOD/vendor sequence runs, **and the CST820 on the same rail
+stays alive** — which is the entire reason wake-on-touch is possible at all.
+
 ## Waking is a full re-init — ~261 ms
 
 VCI going away means the controller forgets everything: wake runs SWRESET,

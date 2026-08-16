@@ -5,8 +5,10 @@
 #include <cstring>
 #include <strings.h>
 
+#include "driver/gpio.h"
 #include "esp_pm.h"
 #include "esp_private/wifi.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs.h"
@@ -186,6 +188,151 @@ static void configure(int maxMhz, int minMhz, bool lightSleep) {
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_pm_configure(&pm));
 }
 
+// TP_INT from the CST820, idle-high through an off-chip 10 kΩ pull-up to
+// VCC3V3. It lives here rather than in panel.cpp because what this probe
+// measures is the sleep plumbing, not the digitiser.
+static const gpio_num_t PIN_TP_INT = GPIO_NUM_21;
+static bool s_intArmed = false;
+
+// Nothing has ever configured this pad, and an unconfigured ESP32-S3 GPIO has
+// its input buffer off — gpio_get_level() then reports 0 whatever the wire is
+// doing, which reads exactly like a line stuck low.
+static void openTpInt() {
+  gpio_config_t cfg = {};
+  cfg.pin_bit_mask = 1ULL << PIN_TP_INT;
+  cfg.mode = GPIO_MODE_INPUT;
+  ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
+}
+
+// gpio_wakeup_enable() is also what exempts the pin from
+// CONFIG_PM_SLP_DISABLE_GPIO, which is on (selected by the light-sleep GPIO
+// reset workaround) and isolates every other pad on the way into automatic
+// sleep. Arming by hand through rtc_gpio_wakeup_enable() would skip that and
+// the pin would be deaf.
+static void armTpInt(bool on) {
+  openTpInt();
+  if (on) {
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(PIN_TP_INT, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
+  } else {
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_disable(PIN_TP_INT));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO));
+  }
+  s_intArmed = on;
+}
+
+// Open drain, so the bench can pull the line low exactly as the digitiser does
+// without ever fighting it for the high level.
+static bool driveTpInt(const char *how) {
+  if (strcasecmp(how, "z") == 0) {
+    return gpio_set_direction(PIN_TP_INT, GPIO_MODE_INPUT) == ESP_OK;
+  }
+  if (strcmp(how, "0") != 0 && strcmp(how, "1") != 0) {
+    return false;
+  }
+  gpio_set_direction(PIN_TP_INT, GPIO_MODE_INPUT_OUTPUT_OD);
+  return gpio_set_level(PIN_TP_INT, how[0] - '0') == ESP_OK;
+}
+
+// The one measurement a serial cable cannot sit through: light sleep kills
+// USB-CDC, so the window has to be opened, sampled and closed without a byte
+// crossing the wire. esp_sleep_get_wakeup_causes() is a register read of what
+// woke the chip last, and it is valid after light sleep, not only deep — so
+// sampling it says which source the automatic path actually honoured.
+struct WatchResult {
+  uint32_t ms, samples, gpio, timer, other, low, mask;
+  bool armed;
+};
+static WatchResult s_watch = {};
+
+// Kept rather than only printed: light sleep stutters USB-CDC, and the line
+// that matters is the one the window itself swallows.
+static void reportWatch() {
+  if (s_watch.samples == 0) {
+    return;
+  }
+  printf("TPINT watch %ums armed=%d samples=%u gpio=%u timer=%u other=%u int_low=%u mask=0x%08X\n",
+         (unsigned)s_watch.ms, s_watch.armed ? 1 : 0, (unsigned)s_watch.samples,
+         (unsigned)s_watch.gpio, (unsigned)s_watch.timer, (unsigned)s_watch.other,
+         (unsigned)s_watch.low, (unsigned)s_watch.mask);
+}
+
+static void watchWakeups(uint32_t ms) {
+  bool restore = s_pretendBattery;
+  s_pretendBattery = true;
+  s_watch = {};
+  s_watch.ms = ms;
+  s_watch.armed = s_intArmed;
+  int64_t until = esp_timer_get_time() + (int64_t)ms * 1000;
+  while (esp_timer_get_time() < until) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_watch.samples++;
+    if (gpio_get_level(PIN_TP_INT) == 0) {
+      s_watch.low++;
+    }
+    uint32_t cause = esp_sleep_get_wakeup_causes();
+    s_watch.mask |= cause;
+    if (cause & BIT(ESP_SLEEP_WAKEUP_GPIO)) {
+      s_watch.gpio++;
+    } else if (cause & BIT(ESP_SLEEP_WAKEUP_TIMER)) {
+      s_watch.timer++;
+    } else {
+      s_watch.other++;
+    }
+  }
+  s_pretendBattery = restore;
+  reportWatch();
+}
+
+// Watching the line itself rather than what it woke: a millisecond of
+// granularity is enough for an interrupt meant to be serviced by a polling
+// touch driver, and it costs no interrupt handler competing with the low-level
+// trigger the wake path needs on the same pad.
+static void scopeTpInt(uint32_t ms) {
+  uint32_t samples = 0, low = 0, falls = 0;
+  bool wasLow = gpio_get_level(PIN_TP_INT) == 0;
+  int64_t until = esp_timer_get_time() + (int64_t)ms * 1000;
+  while (esp_timer_get_time() < until) {
+    vTaskDelay(1);
+    bool isLow = gpio_get_level(PIN_TP_INT) == 0;
+    samples++;
+    low += isLow ? 1 : 0;
+    falls += (isLow && !wasLow) ? 1 : 0;
+    wasLow = isLow;
+  }
+  printf("TPINT scope %ums samples=%u low=%u falls=%u\n", (unsigned)ms, (unsigned)samples,
+         (unsigned)low, (unsigned)falls);
+}
+
+static int cmdTpint(int argc, char **argv) {
+  if (argc == 1) {
+    printf("TPINT level=%d armed=%d\n", gpio_get_level(PIN_TP_INT), s_intArmed ? 1 : 0);
+    reportWatch();
+    return 0;
+  }
+  if (argc == 2 && strcasecmp(argv[1], "arm") == 0) {
+    armTpInt(true);
+  } else if (argc == 2 && strcasecmp(argv[1], "disarm") == 0) {
+    armTpInt(false);
+  } else if (argc == 3 && strcasecmp(argv[1], "drive") == 0) {
+    if (!driveTpInt(argv[2])) {
+      printf("ERR usage: tpint drive <0|1|z>\n");
+      return 1;
+    }
+  } else if (argc == 3 && strcasecmp(argv[1], "watch") == 0) {
+    watchWakeups((uint32_t)strtoul(argv[2], nullptr, 10));
+    return 0;
+  } else if (argc == 3 && strcasecmp(argv[1], "scope") == 0) {
+    scopeTpInt((uint32_t)strtoul(argv[2], nullptr, 10));
+    return 0;
+  } else {
+    printf("ERR usage: tpint [arm|disarm|drive <0|1|z>|scope <ms>|watch <ms>]\n");
+    return 1;
+  }
+  printf("TPINT level=%d armed=%d\n", gpio_get_level(PIN_TP_INT), s_intArmed ? 1 : 0);
+  return 0;
+}
+
 static int cmdPower(int argc, char **argv) {
   if (argc == 1) {
     report();
@@ -287,6 +434,13 @@ void powerBegin() {
                      "'off'|'80'|'160'|'240' pin the clock instead, 'active <ms>' sets the WiFi "
                      "minimum active time, 'usbsim on|off' fakes the cable being out (debug)",
                      cmdPower);
+  openTpInt();
+  consoleRegisterCmd("tpint",
+                     "Touch INT (GPIO21) wake probe: no args reads the line, 'arm'|'disarm' the "
+                     "light-sleep wake source, 'drive <0|1|z>' pulls it open-drain, 'scope <ms>' "
+                     "samples the line every ms, 'watch <ms>' runs a battery-simulated window and "
+                     "counts what woke the chip",
+                     cmdTpint);
   consoleRegisterCmd("ps", "Set WiFi power save: none | min | max", cmdPs);
   consoleRegisterCmd("battlog", "Dump the battery drain log, oldest first", cmdBattlog);
 }
@@ -305,11 +459,19 @@ static void sample(const PmuStatus &pmu, bool boot) {
 
 void powerPoll() {
   PmuStatus pmu = pmuStatus();
-  if (!pmu.present || pmu.millivolts == 0) {
+  if (!pmu.present) {
     return;
   }
 
+  // Ahead of the battery check, because the lock only needs to know about VBUS:
+  // a board running with no battery reads 0 mV, and gating this on that reading
+  // pinned such a board awake for its whole life while `power` cheerfully
+  // reported light sleep enabled.
   holdAwake(pmu.onUsb && !s_pretendBattery);
+
+  if (pmu.millivolts == 0) {
+    return;
+  }
 
   static uint32_t lastAt = 0;
   static bool firstSample = true;

@@ -27,6 +27,13 @@ void panelSleep();
 void panelWake();
 bool panelAsleep();
 
+// The shallower pair: the rail stays up and the controller goes into SLPIN, so
+// the digitiser on the same rail stays alive and the way back is a settle
+// rather than a module cold start. Same ui-task-only rule as the pair above.
+void panelDoze();
+void panelRouse(uint32_t settleMs);
+bool panelDozing();
+
 // True while a finger is down; coordinates are panel pixels (368x448).
 bool panelTouch(int16_t *x, int16_t *y);
 

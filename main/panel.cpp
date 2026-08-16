@@ -49,6 +49,15 @@ static const size_t FRAME_BYTES = (size_t)PANEL_W * PANEL_H * sizeof(uint16_t);
 // The QSPI command word the CO5300 expects: opcode 0x02 (write command) in the
 // top byte, the register in the next one.
 static const uint32_t QSPI_CMD_BRIGHTNESS = (0x02u << 24) | (0x51u << 8);
+// esp_lcd has a disp_sleep op, and esp_lcd_co5300 leaves it null — its
+// disp_on_off sends DISPON/DISPOFF and nothing else — so SLPIN and SLPOUT go
+// out as raw command words like the brightness register does.
+static const uint32_t QSPI_CMD_SLPIN = (0x02u << 24) | (0x10u << 8);
+static const uint32_t QSPI_CMD_SLPOUT = (0x02u << 24) | (0x11u << 8);
+// The CO5300 datasheet allows SLPOUT 120 ms to settle before the next sleep
+// command; the vendor init sequence waits 60. Left as an argument because the
+// difference is the whole point of the measurement.
+static const uint32_t SLPOUT_SETTLE_MS = 120;
 
 static esp_lcd_panel_io_handle_t s_io = nullptr;
 static esp_lcd_panel_handle_t s_panel = nullptr;
@@ -56,6 +65,7 @@ static i2c_master_dev_handle_t s_tca = nullptr;
 static i2c_master_dev_handle_t s_touch = nullptr;
 static uint16_t *s_frame = nullptr;
 static bool s_asleep = false;
+static bool s_dozing = false;
 static SemaphoreHandle_t s_flushDone = nullptr;
 static uint32_t s_lastFlushUs = 0;
 
@@ -189,7 +199,7 @@ bool panelInit() {
 // covers pollState(), builderNeedsRedraw() and the Matter backlight endpoint at
 // once, which guarding each caller would not.
 void panelBrightness(uint8_t level) {
-  if (s_asleep) {
+  if (s_asleep || s_dozing) {
     return;
   }
   // The component's own setter takes 0-100 and logs at INFO on every call; the
@@ -255,6 +265,45 @@ void panelWake() {
   ESP_LOGI(TAG, "panel wake took %u ms", (unsigned)((esp_timer_get_time() - startedAt) / 1000));
 }
 
+// The other way to darken the screen: VCI stays up, the controller goes into
+// SLPIN, and the CST820 on the same rail keeps scanning — which is what makes
+// wake-on-touch possible at all. Measured against panelSleep()/panelWake() to
+// price the tier; the ui task owns both pairs.
+bool panelDozing() {
+  return s_dozing;
+}
+
+void panelDoze() {
+  if (s_asleep || s_dozing) {
+    return;
+  }
+  int64_t startedAt = esp_timer_get_time();
+  gfxFillScreen(COL_BLACK);
+  panelFlush();
+  panelBrightness(0);
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, false));
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(s_io, QSPI_CMD_SLPIN, nullptr, 0));
+  s_dozing = true;
+  ESP_LOGI(TAG, "panel doze took %u ms", (unsigned)((esp_timer_get_time() - startedAt) / 1000));
+}
+
+// No SWRESET, no MADCTL/COLMOD, no vendor sequence: the controller kept its
+// configuration and its GRAM, so the whole cost is the SLPOUT settle.
+void panelRouse(uint32_t settleMs) {
+  if (!s_dozing) {
+    return;
+  }
+  int64_t startedAt = esp_timer_get_time();
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(s_io, QSPI_CMD_SLPOUT, nullptr, 0));
+  vTaskDelay(pdMS_TO_TICKS(settleMs));
+  s_dozing = false;
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(s_panel, true));
+  panelFlush();
+  panelBrightness(PANEL_ON_BRIGHTNESS);
+  ESP_LOGI(TAG, "panel rouse took %u ms (settle %u)",
+           (unsigned)((esp_timer_get_time() - startedAt) / 1000), (unsigned)settleMs);
+}
+
 // The ui task is the only task that may be inside this, panelSleep(),
 // panelWake(), panelBrightness() or any gfx call. esp_lcd's panel IO handle is
 // shared by draw_bitmap and tx_param and is not thread safe, so a second task
@@ -281,7 +330,7 @@ void panelWake() {
 // ~18 ms flush instead of leaving a garbled band that stands until the screen
 // next changes, which on a screen that has gone quiet could be a long time.
 void panelFlush() {
-  if (s_asleep) {
+  if (s_asleep || s_dozing) {
     return;
   }
   int64_t startedAt = esp_timer_get_time();
@@ -412,7 +461,49 @@ static int cmdScreendump(int argc, char **argv) {
   return 0;
 }
 
+// Which registers this part actually has is an open question: the generic
+// CST816S map has already been caught claiming one (0xFE) that is not here, and
+// the low-power commands all live in that unverified half of the map. Reading
+// the whole space is the only honest way to find out which addresses answer —
+// a NAK prints as `--`, so the gaps are as informative as the values.
+static int cmdTouchreg(int argc, char **argv) {
+  if (argc == 3) {
+    uint8_t reg = (uint8_t)strtoul(argv[1], nullptr, 0);
+    uint8_t value = (uint8_t)strtoul(argv[2], nullptr, 0);
+    esp_err_t err = i2cWriteReg(s_touch, reg, value);
+    printf("TOUCHREG write %02X=%02X %s\n", reg, value, err == ESP_OK ? "ok" : esp_err_to_name(err));
+    return err == ESP_OK ? 0 : 1;
+  }
+  if (argc == 2) {
+    uint8_t reg = (uint8_t)strtoul(argv[1], nullptr, 0);
+    uint8_t value = 0;
+    esp_err_t err = i2cReadReg(s_touch, reg, &value, 1);
+    if (err != ESP_OK) {
+      printf("TOUCHREG %02X -- %s\n", reg, esp_err_to_name(err));
+      return 1;
+    }
+    printf("TOUCHREG %02X=%02X\n", reg, value);
+    return 0;
+  }
+  for (int base = 0; base < 256; base += 16) {
+    char line[80];
+    int at = snprintf(line, sizeof(line), "TOUCHREG %02X:", base);
+    for (int offset = 0; offset < 16; offset++) {
+      uint8_t value = 0;
+      if (i2cReadReg(s_touch, (uint8_t)(base + offset), &value, 1) == ESP_OK) {
+        at += snprintf(line + at, sizeof(line) - at, " %02X", value);
+      } else {
+        at += snprintf(line + at, sizeof(line) - at, " --");
+      }
+    }
+    printf("%s\n", line);
+  }
+  return 0;
+}
+
 static void registerCommands() {
   consoleRegisterCmd("touchdump", "Stream touch register changes for <ms>", cmdTouchdump);
+  consoleRegisterCmd("touchreg", "Dump the CST820 register map, or read/write <reg> [<value>]",
+                     cmdTouchreg);
   consoleRegisterCmd("screendump", "Stream the framebuffer as base64", cmdScreendump);
 }

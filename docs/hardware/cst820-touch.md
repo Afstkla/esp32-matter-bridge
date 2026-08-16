@@ -36,12 +36,83 @@ flag (0x8 down, 0x4 up). No rotation or axis swap — touch and display share
 one coordinate space. Corners measured on our unit: TL (27,38), TR (318,59),
 BL (23,419), BR (318,412).
 
-**Known wrong for our unit:** the generic CST816S datasheet's `0xFE`
-"DisAutoSleep" register **is not in this part's register map**. Ignore any
-DisAutoSleep advice found online. This is the one confirmed deviation from
-the generic docs, and it is the reason to distrust the rest of them
-(auto-sleep timeout `0xF9`, gesture-wake mask `0xEC`, the software-sleep
-command `0xA5 = 0x03`) until each is probed on hardware.
+## The register map, read off our own unit
+
+`touchreg` dumps all 256 addresses (`touchreg <reg> [<value>]` reads or
+writes one). Idle, untouched, with the rail up, our unit reads:
+
+```
+00: 00 00 00 00 00 00 00 00 00 FF FF FF FF FF FF FF
+10: FF FF FF FF 00 00 00 00 00 00 00 00 00 00 00 00
+20: 00 00 00 00 00 00 00 00 00 FF FF FF FF FF FF FF   <- 0x00..0x1F, mirrored
+30: FF FF FF FF 00 00 00 00 00 00 00 00 00 00 00 00
+40..9F: all 00
+A0: 00 00 00 00 00 00 00 B7 41 02 FF 00 00 00 00 00
+B0: 01 59 01 5A 00 00 00 00 00 00 00 00 00 00 00 00
+C0: 00 00 00 00 00 00 00 00 00 00 00 00 42 43 44 45
+D0: 46 56 55 10 40 41 50 51 52 53 54 17 00 00 00 00
+E0: 00 00 00 00 00 00 00 00 00 00 07 00 01 01 00 00
+F0: 00 00 00 00 00 00 00 00 00 00 70 00 00 17 01 00
+```
+
+Every address ACKs — the part answers its whole 8-bit space, so a NAK is
+never "no such register", it is always "the chip is not listening". That
+distinction is what the old `0xFE` story got wrong (below). `0x00..0x1F`
+mirrors into `0x20..0x3F`, so the report area is 32 bytes wide and decoded on
+the low five bits.
+
+`0xA7 = 0xB7` chip ID, `0xA8 = 0x41` project ID, `0xA9 = 0x02` firmware
+version. `0xFA` **always reads back `0x70`** whatever is written to it — the
+write lands (touch reporting depends on it) but the readback is not the value
+you wrote, so `0xFA` cannot be used to probe which interrupt modes exist.
+Writing `0xFA = 0x80` (the generic map's "EnTest", which is supposed to make
+INT emit periodic pulses) produced **no INT activity at all** over 3 s at 1 ms
+sampling: there is no self-test pulse on this part, and therefore no way to
+exercise the INT line without a finger.
+
+## Standby is reachable, and it is OFF by default
+
+**Correction — the old "`0xFE` is not in this part's register map" claim is
+wrong.** `0xFE` exists, reads `0x01` out of reset, and is exactly the generic
+map's **DisAutoSleep**: non-zero means *do not* auto-enter low power. Our unit
+therefore ships with **auto-standby disabled**, which is why nothing here had
+ever seen the chip go quiet. What the earlier investigation actually saw was
+the register working:
+
+```
+touchreg 0xFE        -> FE=01          (default: auto-sleep disabled)
+touchreg 0xFE 0x00   -> write ok       (auto-sleep enabled)
+touchreg 0xFE        -> ESP_ERR_INVALID_STATE   (NAK — the chip is in standby)
+touchreg 0xA7        -> ESP_ERR_INVALID_STATE
+tpint                -> level=1        (INT idles high all the way through)
+```
+
+The write succeeds and the chip drops into standby within one transaction;
+its I2C interface goes with it, so the *next* read NAKs. Read that NAK as
+"absent register" and you get the old conclusion. This also confirms on our
+own part the family behaviour the datasheets describe: **you cannot poll your
+way out of low power, only interrupt your way out.**
+
+Recovery is real but not tidy. Sometimes a couple of failed transactions rouse
+it and reads resume (`0xA7 = 0xB7` about 2 s later); sometimes it stays deaf
+while the ui task's 20 ms `pollTouch()` keeps hammering it. **A TP_RST pulse
+always fixes it** — `sleep` then `wake` (which runs `releaseResets()`) restores
+both the chip and `0xFE = 0x01`. Registers are volatile; nothing persists.
+
+`0xA5 = 0x03` (the generic software-sleep command) is **still unprobed**: every
+attempt to write it landed while the chip was already in standby and NAKed.
+
+**Still unverified, and it is the load-bearing one:** whether a finger pulls
+INT low *out of* standby. Nothing on this part can fake a touch — no test
+pulse mode (above), and driving GPIO21 from the SoC proves the SoC side only.
+This is a ten-second human check: `touchreg 0xFE 0x00`, wait, tap the glass,
+`tpint scope 3000` should show `falls>0` and `touchreg 0xA7` should answer.
+
+The remaining generic-map claims (auto-sleep timeout `0xF9` — reads `0x00`
+here, gesture-wake mask `0xEC` — reads `0x01`) are still unprobed. Given
+`0xFE` turned out to be *right* rather than absent, the lesson is the reverse
+of the one this file used to draw: distrust the earlier refutations as much as
+the datasheets, and re-probe with the NAK-means-asleep reading in mind.
 
 ## It shares the panel's power rail
 
@@ -82,12 +153,69 @@ gpio_wakeup_enable(GPIO_NUM_21, GPIO_INTR_LOW_LEVEL);
 esp_sleep_enable_gpio_wakeup();
 ```
 
-Idle-high with an active-low pulse is the family norm, so level-low is the
-expected trigger — **polarity unverified on our unit, bench-check first.**
-Arm it once (wakeup sources are a persistent bitmap, not a per-sleep arm),
-and note that if `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` is ever
-turned on, plain `esp_sleep_enable_gpio_wakeup()` stops working. It is off
-today.
+**Idle level measured: high (1).** Rail up with the digitiser alive, rail cut
+with it unpowered, and in standby — GPIO21 reads 1 in all three, so the 10 kΩ
+pull-up is on the always-on side of `DSI_PWR_EN` and **level-low is the right
+trigger**. It never asserts on its own: 3 s at 1 ms sampling with the chip
+awake and configured shows `low=0 falls=0`.
+
+**Nothing had configured the pad, and that reads exactly like a stuck line.**
+An unconfigured ESP32-S3 GPIO has its input buffer off and `gpio_get_level()`
+returns 0 regardless of the wire. The first measurement here said "idle low"
+for that reason alone. Call `gpio_config()` with `GPIO_MODE_INPUT` before
+believing any reading — `powerBegin()` now does.
+
+Arm it once (wakeup sources are a persistent bitmap, not a per-sleep arm).
+Two config caveats:
+
+- `CONFIG_PM_SLP_DISABLE_GPIO` **is on** — not by choice; the light-sleep GPIO
+  reset workaround `select`s it. It isolates every pad on the way into
+  automatic sleep, which would make GPIO21 deaf. `gpio_wakeup_enable()` is
+  what saves this: it calls `gpio_hal_sleep_sel_dis()` on the pin under that
+  same Kconfig. Arming by hand through `rtc_gpio_wakeup_enable()` would skip
+  it and the pin would sleep through every touch.
+- if `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` is ever turned on, plain
+  `esp_sleep_enable_gpio_wakeup()` stops working. It is off today, and GPIO21
+  is an RTC IO (the S3's RTC range is 0–21), so the
+  `..._on_hp_periph_powerdown()` variant would be available if it ever matters.
+
+`tpint` is the bench instrument for all of this: level and armed state with no
+argument, `arm`/`disarm`, `drive <0|1|z>` to pull the line open-drain from the
+SoC side (open-drain, so it can never fight the digitiser), `scope <ms>` to
+sample the line every millisecond, and `watch <ms>` to run a battery-simulated
+window and count what actually woke the chip. `watch` keeps its last result so
+`tpint` can print it afterwards — light sleep stutters USB-CDC and the line the
+window itself emits is the one most likely to be swallowed.
+
+### The GPIO wake source *is* honoured by automatic light sleep
+
+The open question the desk research flagged — IDF documents GPIO wakeup only
+against manual `esp_light_sleep_start()`, never against the `esp_pm` tickless
+path. Answered on the bench, screen asleep, `usbsim` on, BLE shut down so the
+chip can actually sleep:
+
+| Run | armed | INT | result |
+|---|---|---|---|
+| control | yes | idle high | **199 light sleeps, 0 rejects**, every sample woke on TIMER (`mask=0x10`) |
+| test | yes | held low | **0 further sleeps, 4442 rejects in 8 s** |
+
+The only variable is the line level. A level-triggered source already sitting
+at its trigger level does not wake the chip repeatedly — it makes the hardware
+*refuse* to sleep, and IDF builds that reject mask from the very same bitmap:
+`reject_triggers = s_config.wakeup_triggers & RTC_SLEEP_REJECT_MASK`, and
+`RTC_GPIO_TRIG_EN` is in that mask (`esp_private/esp_pmu.h`). The automatic
+path adds its own timer source on top and calls the same
+`esp_light_sleep_start()` (`pm_impl.c`'s `vApplicationSleep`), clearing
+nothing. So the GPIO source is armed, live and evaluated on the automatic path.
+
+**What is still not proven is the last hop**: a low pulse *arriving while the
+chip is asleep*. Nothing on this board can produce one on demand — the CST820
+has no test-pulse mode, and the S3's LEDC has no RC_FAST clock option
+(`SOC_LEDC_SUPPORT_RC_FAST_CLOCK` is absent for esp32s3), so no peripheral can
+drive the pad through a light sleep. That hop is ordinary level-detector
+hardware and is what the IDF light_sleep example demonstrates, but it is a
+finger, not an argument. **Human check: arm, sleep the screen, tap the glass,
+confirm the wake.**
 
 ## Low-power figures — datasheet only, UNCONFIRMED on our unit
 

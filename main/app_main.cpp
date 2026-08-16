@@ -39,6 +39,8 @@ static volatile int16_t s_tapX = -1;
 static volatile int16_t s_tapY = 0;
 static volatile int16_t s_brightnessWanted = -1;
 static volatile int8_t s_sleepWanted = -1;  // 0 wake, 1 sleep
+static volatile int8_t s_dozeWanted = -1;   // 0 rouse, 1 doze
+static volatile uint32_t s_rouseSettleMs = 120;
 
 static uint32_t nowMs() {
   return (uint32_t)(esp_timer_get_time() / 1000);
@@ -279,6 +281,18 @@ static void pollRequests() {
       printf("%s\n", panelAsleep() ? "WAKE failed" : "WAKE");
     }
   }
+  if (s_dozeWanted >= 0) {
+    bool wantsDoze = s_dozeWanted == 1;
+    s_dozeWanted = -1;
+    if (wantsDoze) {
+      panelDoze();
+    } else {
+      panelRouse(s_rouseSettleMs);
+      noteActivity();
+      drawScreen();
+    }
+    printf("DOZE %d\n", panelDozing() ? 1 : 0);
+  }
   if (s_swipeWanted != 0) {
     int8_t direction = s_swipeWanted;
     s_swipeWanted = 0;
@@ -476,6 +490,20 @@ static int cmdWake(int argc, char **argv) {
   return 0;
 }
 
+// The rail-up counterpart of `sleep`/`wake`, kept as its own command so the two
+// costs can be measured against each other on one binary.
+static int cmdDoze(int argc, char **argv) {
+  if (argc < 2 || (strcmp(argv[1], "0") != 0 && strcmp(argv[1], "1") != 0)) {
+    printf("ERR usage: doze <0|1> [settle-ms]\n");
+    return 1;
+  }
+  if (argc == 3) {
+    s_rouseSettleMs = (uint32_t)strtoul(argv[2], nullptr, 10);
+  }
+  s_dozeWanted = argv[1][0] - '0';
+  return 0;
+}
+
 static int cmdSlots(int argc, char **argv) {
   for (uint8_t i = 0; i < builderSlotCount(); i++) {
     if (!builderSlotUsed(i)) {
@@ -526,6 +554,8 @@ static void registerCommands() {
   consoleRegisterCmd("bright", "Set panel brightness 0-255", cmdBright);
   consoleRegisterCmd("sleep", "Blank the screen", cmdSleep);
   consoleRegisterCmd("wake", "Unblank the screen and redraw", cmdWake);
+  consoleRegisterCmd("doze", "Blank the screen with SLPIN, rail up: doze <0|1> [settle-ms]",
+                     cmdDoze);
   consoleRegisterCmd("qr", "Toggle the pairing screen", cmdQr);
   consoleRegisterCmd("idle", "Blank the screen after <seconds>, 0 to never", cmdIdle);
   consoleRegisterCmd("reset", "reset slots: clear the layout and restart", cmdReset);

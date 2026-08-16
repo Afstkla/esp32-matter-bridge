@@ -45,6 +45,28 @@ answering. Rules that follow:
 - This is why `powerBegin()` holds an `ESP_PM_NO_LIGHT_SLEEP` lock while
   VBUS is present: on USB the console must stay alive.
 
+## Two things silently pin the device awake
+
+Neither is visible in `power`, which happily prints `light_sleep=1` while the
+chip has never slept once. `power locks` is the honest readout — the
+`Sleep stats: light_sleep_counts` line at the bottom is the number that
+settles it.
+
+- **CHIPoBLE holds `NO_LIGHT_SLEEP` for the whole life of an uncommissioned
+  device.** The BT controller takes a lock named `btLS` when it is enabled and
+  only releases it when CHIP deinits BLE — which happens on *commissioning
+  completion*, not when the pairing window expires
+  (`BLEManagerImpl::DriveBLEState` deinits only once the CHIPoBLE service mode
+  leaves `Enabled`). So a factory-fresh or decommissioned Genie **never light
+  sleeps at all**, cable or no cable, and any bench measurement of sleep on an
+  uncommissioned board reads 100% awake. To measure anyway, schedule
+  `BLEMgr().Shutdown()` onto the CHIP task (`ScheduleWork`); the log answers
+  `BLE deinit successful and memory reclaimed` and the lock disappears.
+- **A board with no battery used to pin itself awake too.** `powerPoll()` bailed
+  on `pmu.millivolts == 0` *before* applying the USB lock, so a batteryless
+  board (`PMU batt=0mV`) held `usb` forever and `power usbsim on` did nothing.
+  Fixed — the lock is applied on `pmu.present` alone, which is all VBUS needs.
+
 **Sticky USB download mode** (Arduino-era finding, hardware behaviour, still
 true): the S3 stays in download mode across a `USB_UART_CHIP_RESET`, so once
 in, no number of resets boots the app — `boot:0x23 (DOWNLOAD(USB/UART0))` in
@@ -120,7 +142,7 @@ default.
 | I2C SDA | 15 | shared bus |
 | I2C SCL | 14 | shared bus |
 | BOOT key | 0 | active low, internal pull-up |
-| **TP_INT** | **21** | CST820 interrupt, 10 kΩ pull-up to VCC3V3. **Reserved for wake-on-touch (task #22) and currently unconfigured** — nothing in `main/` touches it |
+| **TP_INT** | **21** | CST820 interrupt, 10 kΩ pull-up to VCC3V3 — **measured idle-high** with the rail both up and cut, so the pull-up is upstream of `DSI_PWR_EN` and level-low is the wake trigger. `powerBegin()` configures it as an input; the `tpint` console command owns it. See [cst820-touch.md](cst820-touch.md) |
 | I2S MCLK | 16 | audio, wired and mandatory |
 | I2S BCLK | 9 | audio |
 | I2S WS | 45 | audio, **strapping pin** |
